@@ -20,6 +20,8 @@ type TrainInput struct {
 	Team         string
 	Example      string
 	GPUs         int
+	Nodes        int
+	GPUsPerNode  int
 	CPUs         int
 	MemoryMB     int64
 	Walltime     string
@@ -103,14 +105,30 @@ func BuildTrainSpec(in TrainInput) (domain.JobSpec, error) {
 		if in.GPUs <= 0 {
 			in.GPUs = 1
 		}
-		if in.GPUs > 8 {
-			return domain.JobSpec{}, fmt.Errorf("fuse train --example nanochat currently supports a single node up to 8 GPUs; use fuse shard plus the manual Slurm path for multi-node runs")
+		if in.GPUsPerNode <= 0 {
+			in.GPUsPerNode = minInt(8, in.GPUs)
+		}
+		if in.Nodes <= 0 {
+			in.Nodes = maxInt(1, in.GPUs/in.GPUsPerNode)
+			if in.GPUs%in.GPUsPerNode != 0 {
+				in.Nodes++
+			}
+		}
+		if in.Nodes > 1 && in.GPUs%in.GPUsPerNode != 0 {
+			return domain.JobSpec{}, fmt.Errorf("fuse train --example nanochat currently requires total gpus to be divisible by gpus-per-node for multi-node runs")
+		}
+		if in.Nodes > 1 && in.GPUsPerNode <= 0 {
+			return domain.JobSpec{}, fmt.Errorf("gpus-per-node must be greater than zero for multi-node nanochat")
+		}
+		perTaskGPUs := in.GPUs
+		if in.Nodes > 1 {
+			perTaskGPUs = in.GPUsPerNode
 		}
 		if in.CPUs <= 0 {
-			in.CPUs = 4 * in.GPUs
+			in.CPUs = 4 * perTaskGPUs
 		}
 		if in.MemoryMB <= 0 {
-			in.MemoryMB = int64(20 * 1024 * maxInt(1, in.GPUs))
+			in.MemoryMB = int64(20 * 1024 * maxInt(1, perTaskGPUs))
 		}
 		if in.Walltime == "" {
 			in.Walltime = "00:10:00"
@@ -124,12 +142,26 @@ func BuildTrainSpec(in TrainInput) (domain.JobSpec, error) {
 		if in.GPUs > 1 {
 			in.Env["OMP_NUM_THREADS"] = "1"
 		}
+		if in.Nodes > 1 {
+			in.Env["NCCL_IB_DISABLE"] = defaultString(in.Env["NCCL_IB_DISABLE"], "1")
+			in.Env["NCCL_SOCKET_IFNAME"] = defaultString(in.Env["NCCL_SOCKET_IFNAME"], "enp71s0")
+			spec.Nodes = in.Nodes
+			spec.Tasks = in.Nodes
+			spec.TasksPerNode = 1
+			spec.GPUsPerNode = in.GPUsPerNode
+			spec.TopologyHint = domain.TopologySameSwitch
+		}
 		spec.GPUs = in.GPUs
 		spec.CPUs = in.CPUs
 		spec.MemoryMB = in.MemoryMB
 		spec.Walltime = in.Walltime
 		spec.ContainerImage = in.Image
-		if in.GPUs == 1 {
+		if in.Nodes > 1 {
+			spec.CommandOrRecipe = wrapForHold(
+				buildMultiNodeNanochatCommand(in.Nodes, in.GPUsPerNode, path.Join(in.WorkloadRoot, "nanochat_smoke.py"), in.Steps),
+				in.HoldSeconds,
+			)
+		} else if in.GPUs == 1 {
 			spec.CommandOrRecipe = wrapForHold(
 				fmt.Sprintf("python %s --steps %d", shellQuote(path.Join(in.WorkloadRoot, "nanochat_smoke.py")), in.Steps),
 				in.HoldSeconds,
@@ -183,6 +215,20 @@ func maxInt(a, b int) int {
 	return b
 }
 
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func defaultString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
 func wrapForHold(command string, holdSeconds int) string {
 	if holdSeconds <= 0 {
 		return command
@@ -191,4 +237,20 @@ func wrapForHold(command string, holdSeconds int) string {
 		"bash -lc %q",
 		fmt.Sprintf("%s; printf 'FUSE_HOLD_SECONDS=%d\\n'; sleep %d", command, holdSeconds, holdSeconds),
 	)
+}
+
+func buildMultiNodeNanochatCommand(nodes, gpusPerNode int, scriptPath string, steps int) string {
+	launch := fmt.Sprintf(
+		`torchrun --nnodes=%d --node_rank="$SLURM_PROCID" --nproc-per-node=%d --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" %s --steps %d`,
+		nodes,
+		gpusPerNode,
+		shellQuote(scriptPath),
+		steps,
+	)
+	parts := []string{
+		`export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"`,
+		`export MASTER_PORT="${MASTER_PORT:-29500}"`,
+		fmt.Sprintf(`srun --ntasks=%d --ntasks-per-node=1 bash -lc %s`, nodes, shellQuote(launch)),
+	}
+	return strings.Join(parts, "; ")
 }

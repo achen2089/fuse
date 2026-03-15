@@ -852,17 +852,21 @@ func (s *Service) hydrateJobRuntime(ctx context.Context, job *domain.Job) error 
 		}
 		return err
 	}
+	applyAttemptRuntime(job, attempt)
+	return nil
+}
+
+func applyAttemptRuntime(job *domain.Job, attempt domain.JobAttempt) {
 	job.Attempt = attempt.Attempt
 	job.Executor = attempt.Executor
 	job.SlurmJobID = attempt.SlurmJobID
 	job.NodeList = append([]string(nil), attempt.NodeList...)
-	if attempt.ExitCode == nil {
+	if attempt.ExitCode == nil || !job.State.Terminal() {
 		job.ExitCode = nil
-		return nil
+		return
 	}
 	code := *attempt.ExitCode
 	job.ExitCode = &code
-	return nil
 }
 
 func IsNotFound(err error) bool {

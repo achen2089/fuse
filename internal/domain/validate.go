@@ -40,11 +40,17 @@ func (s JobSpec) Validate() error {
 	if s.GPUs <= 0 {
 		return errors.New("gpus must be greater than zero")
 	}
-	if s.MemoryMB < 0 || s.CPUs < 0 {
-		return errors.New("cpus and memory must be non-negative")
+	if s.MemoryMB < 0 || s.CPUs < 0 || s.Nodes < 0 || s.Tasks < 0 || s.TasksPerNode < 0 || s.GPUsPerNode < 0 {
+		return errors.New("cpus, memory, nodes, tasks, and per-node counts must be non-negative")
 	}
 	if s.CommandOrRecipe == "" {
 		return errors.New("command_or_recipe is required")
+	}
+	if s.Nodes > 0 && s.GPUsPerNode > 0 && s.Nodes*s.GPUsPerNode != s.GPUs {
+		return errors.New("nodes * gpus_per_node must equal total gpus")
+	}
+	if s.Nodes > 0 && s.Tasks > 0 && s.TasksPerNode > 0 && s.Nodes*s.TasksPerNode != s.Tasks {
+		return errors.New("nodes * tasks_per_node must equal total tasks")
 	}
 	if s.ContainerImage == "" && (len(s.ContainerMounts) > 0 || s.ContainerWorkdir != "" || s.ContainerMountHome) {
 		return errors.New("container settings require container_image")

@@ -174,6 +174,10 @@ type JobSpec struct {
 	ContainerMountHome bool              `json:"container_mount_home,omitempty"`
 	Env                map[string]string `json:"env"`
 	GPUs               int               `json:"gpus"`
+	Nodes              int               `json:"nodes,omitempty"`
+	Tasks              int               `json:"tasks,omitempty"`
+	TasksPerNode       int               `json:"tasks_per_node,omitempty"`
+	GPUsPerNode        int               `json:"gpus_per_node,omitempty"`
 	CPUs               int               `json:"cpus"`
 	MemoryMB           int64             `json:"memory_mb"`
 	Walltime           string            `json:"walltime"`

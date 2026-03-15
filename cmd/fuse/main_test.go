@@ -177,6 +177,34 @@ func TestSubmitTrainBuildsNanochatTorchrunSpec(t *testing.T) {
 	}
 }
 
+func TestSubmitTrainBuildsMultiNodeNanochatSpec(t *testing.T) {
+	cli := &fakeCLI{
+		submitJob: domain.Job{
+			ID:         "nanochat-multinode",
+			State:      domain.JobStatePending,
+			SlurmJobID: "44445",
+		},
+	}
+
+	if err := submitTrain(context.Background(), cli, []string{
+		"--example", "nanochat",
+		"--name", "nanochat-multinode",
+		"--gpus", "16",
+	}, false); err != nil {
+		t.Fatalf("submit train: %v", err)
+	}
+
+	if cli.submittedSpec.Nodes != 2 || cli.submittedSpec.Tasks != 2 || cli.submittedSpec.TasksPerNode != 1 || cli.submittedSpec.GPUsPerNode != 8 {
+		t.Fatalf("unexpected multinode spec: %#v", cli.submittedSpec)
+	}
+	if got := cli.submittedSpec.CommandOrRecipe; !strings.Contains(got, "srun --ntasks=2 --ntasks-per-node=1") || !strings.Contains(got, "torchrun --nnodes=2") {
+		t.Fatalf("unexpected multinode train command: %s", got)
+	}
+	if cli.submittedSpec.Env["NCCL_IB_DISABLE"] != "1" || cli.submittedSpec.Env["NCCL_SOCKET_IFNAME"] != "enp71s0" {
+		t.Fatalf("unexpected multinode env: %#v", cli.submittedSpec.Env)
+	}
+}
+
 func TestSubmitTrainSupportsHoldAndAxolotlProbe(t *testing.T) {
 	cli := &fakeCLI{
 		submitJob: domain.Job{
@@ -382,6 +410,12 @@ func TestWantsHelp(t *testing.T) {
 	if !wantsHelp([]string{"tui", "--help"}) {
 		t.Fatalf("expected fuse tui --help to request usage")
 	}
+	if !wantsHelp([]string{"run", "--faker", "--help"}) {
+		t.Fatalf("expected help flags after command flags to request usage")
+	}
+	if wantsHelp([]string{"run", "--", "--help"}) {
+		t.Fatalf("did not expect help after -- to request usage")
+	}
 	if wantsHelp([]string{"status"}) {
 		t.Fatalf("did not expect status to request usage")
 	}
@@ -394,11 +428,56 @@ func TestUsageMentionsCanonicalAndCompatBinaryPaths(t *testing.T) {
 	if !strings.Contains(output, "make build") {
 		t.Fatalf("expected usage to mention make build, got %q", output)
 	}
-	if !strings.Contains(output, "./fuse             Canonical repo-local binary") {
+	if !strings.Contains(output, "./fuse") || !strings.Contains(output, "canonical repo-local binary") {
 		t.Fatalf("expected usage to mention canonical ./fuse path, got %q", output)
 	}
 	if !strings.Contains(output, "./.bin/fuse-live") {
 		t.Fatalf("expected usage to mention compat alias, got %q", output)
+	}
+	if !strings.Contains(output, "Avoid: fuse --faker status") {
+		t.Fatalf("expected usage to explain command ordering, got %q", output)
+	}
+	if !strings.Contains(output, "fuse help run") {
+		t.Fatalf("expected usage to advertise command-specific help, got %q", output)
+	}
+}
+
+func TestHelpTopicFromArgs(t *testing.T) {
+	if got := helpTopicFromArgs([]string{"help", "run"}); got != "run" {
+		t.Fatalf("expected help topic run, got %q", got)
+	}
+	if got := helpTopicFromArgs([]string{"run", "--faker", "--help"}); got != "run" {
+		t.Fatalf("expected run --faker --help to resolve to run, got %q", got)
+	}
+	if got := helpTopicFromArgs([]string{"--faker", "--help"}); got != "" {
+		t.Fatalf("expected root help for leading flags, got %q", got)
+	}
+}
+
+func TestPrintHelpForRunTopic(t *testing.T) {
+	output := captureStdout(t, func() {
+		printHelp([]string{"help", "run"})
+	})
+	if !strings.Contains(output, "Fuse run") {
+		t.Fatalf("expected run topic header, got %q", output)
+	}
+	if !strings.Contains(output, "Everything after `--` becomes the remote command line.") {
+		t.Fatalf("expected run topic summary, got %q", output)
+	}
+	if !strings.Contains(output, "--mount SRC:DST[:FLAGS]") {
+		t.Fatalf("expected run topic flags, got %q", output)
+	}
+}
+
+func TestPrintHelpUnknownTopicFallsBackToUsage(t *testing.T) {
+	output := captureStdout(t, func() {
+		printHelp([]string{"help", "does-not-exist"})
+	})
+	if !strings.Contains(output, `Unknown help topic "does-not-exist".`) {
+		t.Fatalf("expected unknown-topic message, got %q", output)
+	}
+	if !strings.Contains(output, "Command ordering") {
+		t.Fatalf("expected root usage after unknown-topic message, got %q", output)
 	}
 }
 

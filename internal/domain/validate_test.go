@@ -34,3 +34,22 @@ func TestJobSpecValidateAllowsContainerSettingsWithImage(t *testing.T) {
 		t.Fatalf("unexpected validation error: %v", err)
 	}
 }
+
+func TestJobSpecValidateRejectsInconsistentPerNodeCounts(t *testing.T) {
+	spec := JobSpec{
+		Name:            "bad-multinode-spec",
+		Type:            JobTypeTrain,
+		CommandOrRecipe: "/bin/true",
+		GPUs:            16,
+		Nodes:           2,
+		GPUsPerNode:     6,
+		Tasks:           2,
+		TasksPerNode:    1,
+		CPUs:            32,
+		MemoryMB:        1024,
+		Walltime:        "00:01:00",
+	}
+	if err := spec.Validate(); err == nil {
+		t.Fatal("expected multinode validation error")
+	}
+}

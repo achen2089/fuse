@@ -2,7 +2,7 @@ PREFIX ?= $(HOME)/.local/bin
 BIN ?= fuse
 COMPAT_BIN ?= .bin/fuse-live
 
-.PHONY: help build dev-bin install uninstall clean test smoke-live
+.PHONY: help build $(BIN) dev-bin install uninstall clean test smoke-live
 
 help:
 	@printf '%s\n' \

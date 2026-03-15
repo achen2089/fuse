@@ -84,6 +84,36 @@ func TestRenderScriptIncludesContainerDirectives(t *testing.T) {
 	}
 }
 
+func TestRenderScriptIncludesMultiNodeDirectives(t *testing.T) {
+	adapter := New(&fakeRunner{}, "")
+	script := adapter.RenderScript(domain.JobSpec{
+		ID:              "job-3",
+		Name:            "job-3",
+		Type:            domain.JobTypeTrain,
+		CommandOrRecipe: "srun bash -lc 'torchrun ...'",
+		Nodes:           2,
+		Tasks:           2,
+		TasksPerNode:    1,
+		GPUs:            16,
+		GPUsPerNode:     8,
+		CPUs:            32,
+		MemoryMB:        163840,
+		Walltime:        "00:10:00",
+		ArtifactsDir:    "/mnt/sharefs/user44/.fuse/artifacts/job-3",
+	})
+	for _, fragment := range []string{
+		"#SBATCH --nodes=2",
+		"#SBATCH --ntasks=2",
+		"#SBATCH --ntasks-per-node=1",
+		"#SBATCH --gres=gpu:8",
+		"#SBATCH --cpus-per-task=32",
+	} {
+		if !strings.Contains(script, fragment) {
+			t.Fatalf("expected %q in script:\n%s", fragment, script)
+		}
+	}
+}
+
 func TestParseSACCT(t *testing.T) {
 	status, ok := parseSACCT("123", "123|COMPLETED|0:0|n1|2025-03-15T12:00:00|2025-03-15T12:10:00")
 	if !ok {

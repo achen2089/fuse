@@ -110,7 +110,20 @@ func (a *Adapter) RenderScript(spec domain.JobSpec) string {
 	var buf bytes.Buffer
 	buf.WriteString("#!/bin/bash\n")
 	buf.WriteString(fmt.Sprintf("#SBATCH --job-name=%s\n", spec.Name))
-	buf.WriteString(fmt.Sprintf("#SBATCH --gres=gpu:%d\n", spec.GPUs))
+	if spec.Nodes > 0 {
+		buf.WriteString(fmt.Sprintf("#SBATCH --nodes=%d\n", spec.Nodes))
+	}
+	if spec.Tasks > 0 {
+		buf.WriteString(fmt.Sprintf("#SBATCH --ntasks=%d\n", spec.Tasks))
+	}
+	if spec.TasksPerNode > 0 {
+		buf.WriteString(fmt.Sprintf("#SBATCH --ntasks-per-node=%d\n", spec.TasksPerNode))
+	}
+	if spec.GPUsPerNode > 0 {
+		buf.WriteString(fmt.Sprintf("#SBATCH --gres=gpu:%d\n", spec.GPUsPerNode))
+	} else {
+		buf.WriteString(fmt.Sprintf("#SBATCH --gres=gpu:%d\n", spec.GPUs))
+	}
 	if spec.ContainerImage != "" {
 		buf.WriteString(fmt.Sprintf("#SBATCH --container-image=%s\n", spec.ContainerImage))
 	}

@@ -53,7 +53,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if wantsHelp(os.Args[1:]) {
-		usage()
+		printHelp(os.Args[1:])
 		return
 	}
 	if shouldLaunchDefaultTUI(os.Args[1:]) {
@@ -345,19 +345,23 @@ func shouldLaunchDefaultTUI(args []string) bool {
 }
 
 func wantsHelp(args []string) bool {
-	if len(args) == 0 {
-		return false
+	for idx, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if idx == 0 && arg == "help" {
+			return true
+		}
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
 	}
-	switch args[0] {
-	case "help", "-h", "--help":
-		return true
-	}
-	return len(args) > 1 && (args[1] == "-h" || args[1] == "--help")
+	return false
 }
 
 func runTUI(ctx context.Context, args []string) {
 	if wantsHelp(append([]string{"tui"}, args...)) {
-		usage()
+		printHelp(append([]string{"tui"}, args...))
 		return
 	}
 	sourceLabel := tuiSourceLabel(args)
@@ -581,6 +585,8 @@ func submitTrain(ctx context.Context, cli cliAPI, args []string, jsonOut bool) e
 	name := fs.String("name", "", "job name")
 	team := fs.String("team", "default", "team name")
 	gpus := fs.Int("gpus", 0, "gpu count; defaults per example")
+	nodes := fs.Int("nodes", 0, "node count override for multi-node examples")
+	gpusPerNode := fs.Int("gpus-per-node", 0, "GPUs per node override for multi-node examples")
 	cpus := fs.Int("cpus", 0, "cpus per task; defaults per example")
 	mem := fs.Int64("mem-mb", 0, "memory in MB; defaults per example")
 	walltime := fs.String("time", "", "walltime; defaults per example")
@@ -616,6 +622,8 @@ func submitTrain(ctx context.Context, cli cliAPI, args []string, jsonOut bool) e
 		Team:         *team,
 		Example:      *example,
 		GPUs:         *gpus,
+		Nodes:        *nodes,
+		GPUsPerNode:  *gpusPerNode,
 		CPUs:         *cpus,
 		MemoryMB:     *mem,
 		Walltime:     *walltime,
@@ -1023,55 +1031,781 @@ func tuiSourceLabel(args []string) string {
 	}
 }
 
+type helpFlag struct {
+	Name        string
+	Description string
+}
+
+type helpTopic struct {
+	Name     string
+	Summary  string
+	Usage    []string
+	Notes    []string
+	Flags    []helpFlag
+	Examples []string
+	SeeAlso  []string
+}
+
+type helpPair struct {
+	Label       string
+	Description string
+}
+
+func printHelp(args []string) {
+	if topic := helpTopicFromArgs(args); topic != "" {
+		if printCommandHelp(topic) {
+			return
+		}
+		fmt.Printf("Unknown help topic %q.\n\n", topic)
+	}
+	usage()
+}
+
+func helpTopicFromArgs(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	if args[0] == "help" {
+		for _, arg := range args[1:] {
+			if arg == "--" || arg == "-h" || arg == "--help" {
+				break
+			}
+			return arg
+		}
+		return ""
+	}
+	if strings.HasPrefix(args[0], "-") {
+		return ""
+	}
+	for _, arg := range args[1:] {
+		if arg == "--" {
+			break
+		}
+		if arg == "-h" || arg == "--help" {
+			return args[0]
+		}
+	}
+	return ""
+}
+
+func printCommandHelp(name string) bool {
+	topic, ok := lookupHelpTopic(name)
+	if !ok {
+		return false
+	}
+	fmt.Println("Fuse " + topic.Name)
+	fmt.Println()
+	fmt.Println(topic.Summary)
+	fmt.Println()
+	printHelpSection("Usage", topic.Usage...)
+	if len(topic.Notes) > 0 {
+		printHelpSection("Notes", topic.Notes...)
+	}
+	if len(topic.Flags) > 0 {
+		printHelpFlags("Flags", topic.Flags)
+	}
+	if usesSharedConnectionFlags(topic.Name) {
+		printHelpFlags("Shared connection flags", sharedConnectionFlags())
+	}
+	if len(topic.Examples) > 0 {
+		printHelpSection("Examples", topic.Examples...)
+	}
+	if len(topic.SeeAlso) > 0 {
+		printHelpSection("See also", topic.SeeAlso...)
+	}
+	return true
+}
+
+func printHelpSection(title string, lines ...string) {
+	if len(lines) == 0 {
+		return
+	}
+	fmt.Println(title)
+	for _, line := range lines {
+		fmt.Println("  " + line)
+	}
+	fmt.Println()
+}
+
+func printHelpFlags(title string, flags []helpFlag) {
+	if len(flags) == 0 {
+		return
+	}
+	fmt.Println(title)
+	for _, flag := range flags {
+		fmt.Printf("  %-26s %s\n", flag.Name, flag.Description)
+	}
+	fmt.Println()
+}
+
+func printHelpPairs(title string, pairs ...helpPair) {
+	if len(pairs) == 0 {
+		return
+	}
+	fmt.Println(title)
+	for _, pair := range pairs {
+		fmt.Printf("  %-48s %s\n", pair.Label, pair.Description)
+	}
+	fmt.Println()
+}
+
+func sharedConnectionFlags() []helpFlag {
+	return []helpFlag{
+		{Name: "--faker", Description: "use the built-in fake cluster; safest place to learn the CLI and TUI"},
+		{Name: "--addr URL", Description: "talk to a running Fuse HTTP server instead of direct mode"},
+		{Name: "--ssh-host HOST", Description: "override the SSH login host used by direct live mode"},
+		{Name: "--nvml", Description: "probe the local machine with NVIDIA discovery instead of SSH"},
+		{Name: "--json", Description: "emit JSON instead of human-readable text"},
+		{Name: "--db PATH", Description: "override the sqlite state path used in direct or server-backed workflows"},
+		{Name: "--artifacts-dir PATH", Description: "override the artifacts root for generated files and recipes"},
+		{Name: "--guaranteed-gpus N", Description: "override the default guaranteed GPU quota in direct mode"},
+	}
+}
+
+func usesSharedConnectionFlags(name string) bool {
+	switch name {
+	case "server", "bench":
+		return false
+	default:
+		return true
+	}
+}
+
+func lookupHelpTopic(name string) (helpTopic, bool) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "tui":
+		return helpTopic{
+			Name:    "tui",
+			Summary: "Launch the Bubble Tea dashboard. Bare `fuse` is the same entrypoint as `fuse tui`.",
+			Usage: []string{
+				"fuse",
+				"fuse --faker",
+				"fuse tui [connection flags]",
+			},
+			Notes: []string{
+				"Leading flags with no command launch the TUI, so `fuse --faker` opens the dashboard while `fuse status --faker` runs the status command.",
+				"The dashboard refreshes automatically and supports an inline command bar for pane switching and quick actions.",
+				"Use the fake cluster first if you are learning the navigation or verifying the binary works.",
+			},
+			Examples: []string{
+				"./fuse --faker",
+				"./fuse --addr http://127.0.0.1:9090",
+				"./fuse tui --ssh-host user44@cluster-login",
+				"Keys: q quit, r refresh, tab shift focus, / or : open the command bar, ? toggle help",
+				"Command bar: :nodes, :jobs, :events, :refresh, :help, :quit",
+			},
+			SeeAlso: []string{
+				"fuse --help",
+				"fuse help status",
+				"fuse help jobs",
+			},
+		}, true
+	case "status":
+		return helpTopic{
+			Name:    "status",
+			Summary: "Print a one-line cluster summary: nodes, devices, allocated GPUs, idle GPUs, and running or pending job counts.",
+			Usage: []string{
+				"fuse status [connection flags]",
+			},
+			Notes: []string{
+				"Use this first to check that Fuse can reach the target cluster or fake environment.",
+				"`--json` is the easiest mode for scripts and health checks.",
+			},
+			Examples: []string{
+				"./fuse status --faker",
+				"./fuse status --addr http://127.0.0.1:9090",
+				"./fuse status --json --ssh-host user44@cluster-login",
+			},
+			SeeAlso: []string{
+				"fuse help nodes",
+				"fuse help jobs",
+				"fuse help events",
+			},
+		}, true
+	case "nodes":
+		return helpTopic{
+			Name:    "nodes",
+			Summary: "List nodes and their device inventory, allocation state, switch placement, and health.",
+			Usage: []string{
+				"fuse nodes [connection flags]",
+			},
+			Notes: []string{
+				"Human-readable output shows the node name, switch, GPU counts, alloc or free counts, observed state, health, and whether the node is real or synthetic.",
+				"`--json` returns both `nodes` and `devices` arrays for automation.",
+			},
+			Examples: []string{
+				"./fuse nodes --faker",
+				"./fuse nodes --json --addr http://127.0.0.1:9090",
+			},
+			SeeAlso: []string{
+				"fuse help fabric",
+				"fuse help topo",
+			},
+		}, true
+	case "fabric":
+		return helpTopic{
+			Name:    "fabric",
+			Summary: "Show fabric links between nodes, including link tier and bandwidth.",
+			Usage: []string{
+				"fuse fabric [connection flags]",
+			},
+			Notes: []string{
+				"Use this when you need a fast text view of node-to-node connectivity outside the TUI.",
+			},
+			Examples: []string{
+				"./fuse fabric --faker",
+				"./fuse fabric --json --addr http://127.0.0.1:9090",
+			},
+			SeeAlso: []string{
+				"fuse help nodes",
+				"fuse help topo",
+			},
+		}, true
+	case "teams":
+		return helpTopic{
+			Name:    "teams",
+			Summary: "List team quotas, burst status, and accumulated GPU hours.",
+			Usage: []string{
+				"fuse teams [connection flags]",
+			},
+			Examples: []string{
+				"./fuse teams --faker",
+				"./fuse teams --json --addr http://127.0.0.1:9090",
+			},
+			SeeAlso: []string{
+				"fuse help status",
+				"fuse help jobs",
+			},
+		}, true
+	case "jobs":
+		return helpTopic{
+			Name:    "jobs",
+			Summary: "List current jobs with Fuse id, scheduler state, team, GPU count, Slurm id, and node allocation.",
+			Usage: []string{
+				"fuse jobs [connection flags]",
+			},
+			Notes: []string{
+				"This is the fastest way to see which jobs are running, pending, or failed without opening the TUI.",
+				"Use `fuse help why`, `fuse help logs`, and `fuse help cancel` once you have the job id.",
+			},
+			Examples: []string{
+				"./fuse jobs --faker",
+				"./fuse jobs --json --addr http://127.0.0.1:9090",
+			},
+			SeeAlso: []string{
+				"fuse help logs",
+				"fuse help why",
+				"fuse help cancel",
+			},
+		}, true
+	case "events":
+		return helpTopic{
+			Name:    "events",
+			Summary: "Show the latest scheduler events with timestamp, reason code, and summary.",
+			Usage: []string{
+				"fuse events [connection flags]",
+			},
+			Notes: []string{
+				"The CLI currently fetches the 20 most recent events.",
+			},
+			Examples: []string{
+				"./fuse events --faker",
+				"./fuse events --json --addr http://127.0.0.1:9090",
+			},
+			SeeAlso: []string{
+				"fuse help status",
+				"fuse help jobs",
+				"fuse help why",
+			},
+		}, true
+	case "storage":
+		return helpTopic{
+			Name:    "storage",
+			Summary: "Inspect filesystem capacity and usage for the target path or the default storage view.",
+			Usage: []string{
+				"fuse storage [connection flags]",
+				"fuse storage [connection flags] --path /mnt/sharefs",
+			},
+			Flags: []helpFlag{
+				{Name: "--path PATH", Description: "filesystem path to inspect"},
+			},
+			Examples: []string{
+				"./fuse storage --faker",
+				"./fuse storage --path /mnt/sharefs --addr http://127.0.0.1:9090",
+			},
+			SeeAlso: []string{
+				"fuse help status",
+			},
+		}, true
+	case "topo", "topology":
+		return helpTopic{
+			Name:    "topo",
+			Summary: "Probe placement topology for an existing job or request a short-lived allocation to inspect fabric layout.",
+			Usage: []string{
+				"fuse topo [connection flags] --job <fuse-job-id>",
+				"fuse topo [connection flags] --slurm-job <slurm-id>",
+				"fuse topo [connection flags] --gpus 8 --cpus 16 --mem-mb 102400 --time 00:05:00",
+			},
+			Notes: []string{
+				"Use an existing job id when you want to understand where something already landed.",
+				"Use the ephemeral probe mode when you want to test allocation quality before launching a larger workload.",
+			},
+			Flags: []helpFlag{
+				{Name: "--job ID", Description: "Fuse job id to inspect"},
+				{Name: "--slurm-job ID", Description: "Slurm job id to inspect"},
+				{Name: "--node NAME", Description: "probe or focus a specific node"},
+				{Name: "--gpus N", Description: "GPU count for an ephemeral probe allocation"},
+				{Name: "--cpus N", Description: "CPU count for an ephemeral probe allocation"},
+				{Name: "--mem-mb MB", Description: "memory request for an ephemeral probe allocation"},
+				{Name: "--time HH:MM:SS", Description: "walltime for an ephemeral probe allocation"},
+				{Name: "--immediate SECONDS", Description: "seconds to wait for the ephemeral probe allocation"},
+			},
+			Examples: []string{
+				"./fuse topo --faker --job run-123",
+				"./fuse topo --addr http://127.0.0.1:9090 --slurm-job 481516",
+				"./fuse topo --ssh-host user44@cluster-login --gpus 8 --cpus 16 --mem-mb 102400 --time 00:05:00",
+			},
+			SeeAlso: []string{
+				"fuse help shard",
+				"fuse help run",
+			},
+		}, true
+	case "shard":
+		return helpTopic{
+			Name:    "shard",
+			Summary: "Estimate tensor, pipeline, and data-parallel sharding for a model and GPU budget.",
+			Usage: []string{
+				"fuse shard [connection flags] --model <profile> --gpus <count>",
+			},
+			Flags: []helpFlag{
+				{Name: "--model NAME", Description: "model profile name, for example llama-70b"},
+				{Name: "--gpus N", Description: "total GPU count"},
+				{Name: "--nodes N", Description: "optional node-count override"},
+				{Name: "--method MODE", Description: "memory model: full, lora, or inference"},
+			},
+			Examples: []string{
+				"./fuse shard --model llama-70b --gpus 16 --faker",
+				"./fuse shard --model llama-70b --gpus 16 --nodes 2 --method full --json --addr http://127.0.0.1:9090",
+			},
+			SeeAlso: []string{
+				"fuse help topo",
+				"fuse help train",
+				"fuse help finetune",
+			},
+		}, true
+	case "submit":
+		return helpTopic{
+			Name:    "submit",
+			Summary: "Submit a raw JSON JobSpec from a file or stdin. Use this when the built-in command helpers are too restrictive.",
+			Usage: []string{
+				"fuse submit [connection flags] --file job.json",
+				"fuse submit [connection flags] --file - < job.json",
+			},
+			Flags: []helpFlag{
+				{Name: "--file PATH", Description: "path to a JSON JobSpec file, or `-` for stdin"},
+			},
+			Examples: []string{
+				"./fuse submit --faker --file examples/job.json",
+				"./fuse submit --addr http://127.0.0.1:9090 --file - < job.json",
+			},
+			SeeAlso: []string{
+				"fuse help run",
+				"fuse help train",
+				"fuse help finetune",
+			},
+		}, true
+	case "run":
+		return helpTopic{
+			Name:    "run",
+			Summary: "Submit an ad-hoc command as a job. Everything after `--` becomes the remote command line.",
+			Usage: []string{
+				"fuse run [connection flags] [run flags] -- <command> [args...]",
+			},
+			Notes: []string{
+				"Use this for one-off commands, quick smoke tests, interactive shells, and simple containerized experiments.",
+				"Repeat `--env KEY=VALUE` and `--mount SRC:DST[:FLAGS]` as many times as you need.",
+				"If you omit the command after `--`, Fuse will fail before submission.",
+			},
+			Flags: []helpFlag{
+				{Name: "--name NAME", Description: "job name"},
+				{Name: "--team NAME", Description: "team name"},
+				{Name: "--gpus N", Description: "GPU count"},
+				{Name: "--cpus N", Description: "CPUs per task"},
+				{Name: "--mem-mb MB", Description: "memory in MB"},
+				{Name: "--time HH:MM:SS", Description: "walltime"},
+				{Name: "--topology HINT", Description: "topology hint, for example any or same_switch"},
+				{Name: "--workdir DIR", Description: "working directory outside the container"},
+				{Name: "--image PATH", Description: "Pyxis container image or squashfs path"},
+				{Name: "--container-workdir DIR", Description: "working directory inside the container"},
+				{Name: "--mount-home", Description: "mount the user's home directory inside the container"},
+				{Name: "--mount SRC:DST[:FLAGS]", Description: "container mount; repeat to add more mounts"},
+				{Name: "--env KEY=VALUE", Description: "environment override; repeat to add more variables"},
+			},
+			Examples: []string{
+				"./fuse run --faker --name smoke --gpus 1 -- bash -lc 'nvidia-smi'",
+				"./fuse run --addr http://127.0.0.1:9090 --name shell --image /mnt/sharefs/user44/pytorch.sqsh --mount /mnt/sharefs:/mnt/sharefs -- bash -lc 'python -V'",
+				"./fuse run --ssh-host user44@cluster-login --name debug --gpus 2 --topology same_switch --env NCCL_DEBUG=INFO -- python train.py",
+			},
+			SeeAlso: []string{
+				"fuse help train",
+				"fuse help logs",
+				"fuse help why",
+			},
+		}, true
+	case "train":
+		return helpTopic{
+			Name:    "train",
+			Summary: "Submit a built-in training recipe. This is the easiest way to run a known-good example workload.",
+			Usage: []string{
+				"fuse train [connection flags] [train flags]",
+			},
+			Notes: []string{
+				"`--example` currently supports `makemore`, `nanochat`, and `axolotl-probe`.",
+				"Recipe defaults fill in image, resources, and command details so you do not need to author a full JobSpec.",
+				"`--hold` is useful when you want the probe to stay alive briefly for inspection after it succeeds.",
+			},
+			Flags: []helpFlag{
+				{Name: "--example NAME", Description: "training example: makemore, nanochat, or axolotl-probe"},
+				{Name: "--name NAME", Description: "job name; autogenerated if omitted"},
+				{Name: "--team NAME", Description: "team name"},
+				{Name: "--gpus N", Description: "GPU count override"},
+				{Name: "--cpus N", Description: "CPU count override"},
+				{Name: "--mem-mb MB", Description: "memory override in MB"},
+				{Name: "--time HH:MM:SS", Description: "walltime override"},
+				{Name: "--image PATH", Description: "container image override"},
+				{Name: "--shared-root DIR", Description: "shared root mounted inside the container"},
+				{Name: "--workload-root DIR", Description: "remote workload script root"},
+				{Name: "--artifacts-dir DIR", Description: "artifact root; Fuse appends the job name"},
+				{Name: "--steps N", Description: "override training steps for the recipe"},
+				{Name: "--hold SECONDS", Description: "sleep for N seconds after the recipe succeeds"},
+				{Name: "--mount-home", Description: "mount the user's home directory inside the container"},
+				{Name: "--env KEY=VALUE", Description: "environment override; repeat to add more variables"},
+			},
+			Examples: []string{
+				"./fuse train --faker --example makemore --steps 200",
+				"./fuse train --addr http://127.0.0.1:9090 --example nanochat --gpus 4 --name nanochat-smoke",
+				"./fuse train --ssh-host user44@cluster-login --example axolotl-probe --hold 120",
+			},
+			SeeAlso: []string{
+				"fuse help run",
+				"fuse help finetune",
+				"fuse help logs",
+			},
+		}, true
+	case "finetune":
+		return helpTopic{
+			Name:    "finetune",
+			Summary: "Submit the built-in fine-tuning recipe around a model and dataset path.",
+			Usage: []string{
+				"fuse finetune [connection flags] [flags]",
+			},
+			Flags: []helpFlag{
+				{Name: "--name NAME", Description: "job name"},
+				{Name: "--team NAME", Description: "team name"},
+				{Name: "--model MODEL", Description: "model identifier"},
+				{Name: "--data PATH", Description: "dataset path"},
+				{Name: "--workdir DIR", Description: "working directory"},
+				{Name: "--artifacts-dir DIR", Description: "artifact root; Fuse appends the job name"},
+			},
+			Examples: []string{
+				"./fuse finetune --faker --model meta-llama/Llama-2-7b-hf --data ./alpaca.json",
+				"./fuse finetune --addr http://127.0.0.1:9090 --name llama-ft --model meta-llama/Llama-2-7b-hf --data /mnt/sharefs/datasets/alpaca.json",
+			},
+			SeeAlso: []string{
+				"fuse help train",
+				"fuse help logs",
+			},
+		}, true
+	case "logs":
+		return helpTopic{
+			Name:    "logs",
+			Summary: "Fetch stdout or stderr for a job.",
+			Usage: []string{
+				"fuse logs [connection flags] --job <fuse-job-id>",
+				"fuse logs [connection flags] <fuse-job-id>",
+			},
+			Flags: []helpFlag{
+				{Name: "--job ID", Description: "Fuse job id"},
+				{Name: "--stream NAME", Description: "log stream: stdout or stderr"},
+				{Name: "--tail N", Description: "tail the last N lines; 0 means the full file"},
+			},
+			Examples: []string{
+				"./fuse logs --faker --job run-123",
+				"./fuse logs --addr http://127.0.0.1:9090 run-123 --stream stderr --tail 500",
+			},
+			SeeAlso: []string{
+				"fuse help jobs",
+				"fuse help why",
+				"fuse help cancel",
+			},
+		}, true
+	case "why":
+		return helpTopic{
+			Name:    "why",
+			Summary: "Explain a job's current scheduler state, raw state, suggestions, and placement details when available.",
+			Usage: []string{
+				"fuse why [connection flags] --job <fuse-job-id>",
+				"fuse why [connection flags] <fuse-job-id>",
+			},
+			Flags: []helpFlag{
+				{Name: "--job ID", Description: "Fuse job id"},
+			},
+			Examples: []string{
+				"./fuse why --faker --job run-123",
+				"./fuse why --addr http://127.0.0.1:9090 run-123 --json",
+			},
+			SeeAlso: []string{
+				"fuse help jobs",
+				"fuse help logs",
+				"fuse help topo",
+			},
+		}, true
+	case "cancel":
+		return helpTopic{
+			Name:    "cancel",
+			Summary: "Cancel a running or pending job.",
+			Usage: []string{
+				"fuse cancel [connection flags] --job <fuse-job-id>",
+				"fuse cancel [connection flags] <fuse-job-id>",
+			},
+			Flags: []helpFlag{
+				{Name: "--job ID", Description: "Fuse job id"},
+			},
+			Examples: []string{
+				"./fuse cancel --faker --job run-123",
+				"./fuse cancel --addr http://127.0.0.1:9090 run-123",
+			},
+			SeeAlso: []string{
+				"fuse help jobs",
+				"fuse help why",
+			},
+		}, true
+	case "checkpoint":
+		return helpTopic{
+			Name:    "checkpoint",
+			Summary: "Trigger a checkpoint for a job.",
+			Usage: []string{
+				"fuse checkpoint [connection flags] --job <fuse-job-id>",
+				"fuse checkpoint [connection flags] <fuse-job-id>",
+			},
+			Flags: []helpFlag{
+				{Name: "--job ID", Description: "Fuse job id"},
+			},
+			Examples: []string{
+				"./fuse checkpoint --faker --job run-123",
+				"./fuse checkpoint --addr http://127.0.0.1:9090 run-123",
+			},
+			SeeAlso: []string{
+				"fuse help checkpoints",
+			},
+		}, true
+	case "checkpoints":
+		return helpTopic{
+			Name:    "checkpoints",
+			Summary: "List checkpoints that Fuse knows about for a job.",
+			Usage: []string{
+				"fuse checkpoints [connection flags] --job <fuse-job-id>",
+				"fuse checkpoints [connection flags] <fuse-job-id>",
+			},
+			Flags: []helpFlag{
+				{Name: "--job ID", Description: "Fuse job id"},
+			},
+			Examples: []string{
+				"./fuse checkpoints --faker --job run-123",
+				"./fuse checkpoints --addr http://127.0.0.1:9090 run-123 --json",
+			},
+			SeeAlso: []string{
+				"fuse help checkpoint",
+			},
+		}, true
+	case "simulate":
+		return helpTopic{
+			Name:    "simulate",
+			Summary: "Apply a simulation action such as killing a node or adding synthetic nodes.",
+			Usage: []string{
+				"fuse simulate [connection flags] --kill-node <node-id>",
+				"fuse simulate [connection flags] --add-nodes <count> [--switch <name>]",
+			},
+			Notes: []string{
+				"Exactly one simulation action is required per invocation.",
+				"This is mainly useful for demos, fake clusters, and scheduler testing.",
+			},
+			Flags: []helpFlag{
+				{Name: "--kill-node ID", Description: "node id to remove"},
+				{Name: "--add-nodes N", Description: "number of fake nodes to add"},
+				{Name: "--switch NAME", Description: "switch name for newly added nodes"},
+			},
+			Examples: []string{
+				"./fuse simulate --faker --kill-node node-1",
+				"./fuse simulate --faker --add-nodes 2 --switch leaf-a",
+			},
+			SeeAlso: []string{
+				"fuse help status",
+				"fuse help nodes",
+			},
+		}, true
+	case "server":
+		return helpTopic{
+			Name:    "server",
+			Summary: "Run the local Fuse HTTP server. Client commands can then target it with `--addr`.",
+			Usage: []string{
+				"fuse server [flags]",
+			},
+			Flags: []helpFlag{
+				{Name: "--addr HOST:PORT", Description: "listen address"},
+				{Name: "--db PATH", Description: "sqlite database path"},
+				{Name: "--faker", Description: "enable faker discovery"},
+				{Name: "--nvml", Description: "enable local NVIDIA discovery"},
+				{Name: "--ssh-host HOST", Description: "remote SSH host for Slurm commands"},
+				{Name: "--guaranteed-gpus N", Description: "default guaranteed GPU quota for the primary team"},
+				{Name: "--artifacts-dir DIR", Description: "artifacts directory"},
+			},
+			Examples: []string{
+				"./fuse server --addr 127.0.0.1:9090 --faker",
+				"./fuse server --addr 0.0.0.0:9090 --db .fuse/state.db --ssh-host user44@cluster-login",
+				"./fuse status --addr http://127.0.0.1:9090",
+			},
+			SeeAlso: []string{
+				"fuse help status",
+				"fuse help tui",
+			},
+		}, true
+	case "bench":
+		return helpTopic{
+			Name:    "bench",
+			Summary: "Run local benchmark helpers and print the result as JSON.",
+			Usage: []string{
+				"fuse bench [flags]",
+			},
+			Notes: []string{
+				"This is local-machine oriented and does not use the standard client connection flags.",
+			},
+			Flags: []helpFlag{
+				{Name: "--db PATH", Description: "sqlite database path"},
+			},
+			Examples: []string{
+				"./fuse bench",
+				"./fuse bench --db .fuse/state.db",
+			},
+			SeeAlso: []string{
+				"fuse help server",
+			},
+		}, true
+	default:
+		return helpTopic{}, false
+	}
+}
+
 func usage() {
 	fmt.Println("Fuse")
 	fmt.Println()
-	fmt.Println("Usage")
-	fmt.Println("  fuse [--faker|--addr URL|--ssh-host HOST]    Launch the TUI")
-	fmt.Println("  fuse tui [--faker|--addr URL|--ssh-host HOST]")
-	fmt.Println("  fuse <command> [flags]")
+	fmt.Println("Fuse is a cluster CLI and TUI for inspecting capacity, launching GPU jobs, and debugging scheduler placement.")
 	fmt.Println()
-	fmt.Println("First steps")
-	fmt.Println("  make build     Build ./fuse and refresh the legacy ./.bin/fuse-live wrapper")
-	fmt.Println("  ./fuse --help  Show this help")
-	fmt.Println("  ./fuse --faker Launch the local fake-cluster TUI")
-	fmt.Println("  make install   Install fuse into ~/.local/bin (or PREFIX)")
-	fmt.Println()
-	fmt.Println("Binary paths")
-	fmt.Println("  ./fuse             Canonical repo-local binary")
-	fmt.Println("  fuse               Installed binary after make install")
-	fmt.Println("  ./.bin/fuse-live   Generated compatibility wrapper for older scripts")
-	fmt.Println()
-	fmt.Println("Top commands")
-	fmt.Println("  status        Cluster summary")
-	fmt.Println("  nodes         Nodes and devices")
-	fmt.Println("  jobs          Jobs table")
-	fmt.Println("  events        Recent scheduling events")
-	fmt.Println("  topo          Topology probe")
-	fmt.Println("  shard         Sharding recommendation")
-	fmt.Println("  run           Submit an interactive run job")
-	fmt.Println("  train         Submit a training job")
-	fmt.Println("  finetune      Submit a fine-tune job")
-	fmt.Println("  logs          Tail job logs")
-	fmt.Println("  why           Explain scheduler state")
-	fmt.Println("  checkpoint    Trigger a checkpoint")
-	fmt.Println("  checkpoints   List checkpoints for a job")
-	fmt.Println("  simulate      Run a simulation action")
-	fmt.Println("  bench         Run local benchmark helpers")
-	fmt.Println()
-	fmt.Println("TUI discoverability")
-	fmt.Println("  q             Quit")
-	fmt.Println("  tab / shift+tab")
-	fmt.Println("                Move focus between panes")
-	fmt.Println("  :             Open the command bar")
-	fmt.Println("  r             Refresh immediately")
-	fmt.Println("  ?             Toggle the key help footer")
-	fmt.Println()
-	fmt.Println("Command bar examples")
-	fmt.Println("  :nodes")
-	fmt.Println("  :jobs")
-	fmt.Println("  :events")
-	fmt.Println("  :refresh")
-	fmt.Println("  :help")
-	fmt.Println("  :quit")
+	printHelpPairs("Usage",
+		helpPair{Label: "fuse", Description: "launch the dashboard using the default connection source"},
+		helpPair{Label: "fuse --faker", Description: "launch the dashboard against the built-in fake cluster"},
+		helpPair{Label: "fuse tui [connection flags]", Description: "launch the dashboard explicitly"},
+		helpPair{Label: "fuse <command> [flags]", Description: "run a one-shot CLI command"},
+		helpPair{Label: "fuse help <command>", Description: "show detailed help for one command, for example `fuse help run`"},
+	)
+	printHelpSection("Command ordering",
+		"Put connection flags after the command name when you want a CLI command.",
+		"Good:  fuse status --faker",
+		"Good:  fuse jobs --addr http://127.0.0.1:9090",
+		"TUI:   fuse --faker",
+		"Avoid: fuse --faker status",
+		"Leading flags with no command launch the TUI.",
+	)
+	printHelpPairs("First steps",
+		helpPair{Label: "make build", Description: "build ./fuse and refresh the legacy ./.bin/fuse-live wrapper"},
+		helpPair{Label: "./fuse --help", Description: "show this help from the repo-local binary"},
+		helpPair{Label: "./fuse --faker", Description: "open the fake-cluster dashboard and learn the UI safely"},
+		helpPair{Label: "./fuse status --faker", Description: "verify the CLI path without touching live infrastructure"},
+		helpPair{Label: "./fuse help run", Description: "read the main ad-hoc job submission guide"},
+		helpPair{Label: "make install", Description: "install fuse into ~/.local/bin (or PREFIX/bin)"},
+	)
+	printHelpPairs("Binary paths",
+		helpPair{Label: "./fuse", Description: "canonical repo-local binary"},
+		helpPair{Label: "fuse", Description: "installed binary after make install"},
+		helpPair{Label: "./.bin/fuse-live", Description: "generated compatibility wrapper for older scripts"},
+	)
+	printHelpPairs("Connection modes",
+		helpPair{Label: "--faker", Description: "use the built-in fake cluster; best place to learn the CLI"},
+		helpPair{Label: "--addr URL", Description: "talk to a running Fuse HTTP server instead of direct mode"},
+		helpPair{Label: "--ssh-host HOST", Description: "override the SSH login host used by direct live mode"},
+		helpPair{Label: "--nvml", Description: "probe the local machine with NVIDIA discovery instead of SSH"},
+		helpPair{Label: "default behavior", Description: "without `--addr`, `--faker`, or `--nvml`, Fuse falls back to direct live mode"},
+	)
+	printHelpFlags("Shared client flags", sharedConnectionFlags())
+	printHelpPairs("Environment variables",
+		helpPair{Label: "FUSE_DB", Description: "default sqlite path for direct or server-backed workflows"},
+		helpPair{Label: "FUSE_ARTIFACTS_DIR", Description: "default artifacts root for generated files and recipes"},
+		helpPair{Label: "FUSE_SSH_HOST", Description: "default SSH host for direct live mode"},
+		helpPair{Label: "FUSE_GUARANTEED_GPUS", Description: "default guaranteed GPU quota for direct mode"},
+	)
+	printHelpSection("Inspect the cluster",
+		"status        One-line cluster summary",
+		"nodes         Nodes, GPU counts, switch placement, and health",
+		"fabric        Fabric links and bandwidth",
+		"teams         Team quotas and GPU hours",
+		"jobs          Job list with state and node placement",
+		"events        Recent scheduler events",
+		"storage       Filesystem usage and capacity",
+		"tui           Full-screen dashboard",
+	)
+	printHelpSection("Plan placement and topology",
+		"topo          Probe placement for a job or ephemeral allocation",
+		"shard         Estimate tensor, pipeline, and data parallel splits",
+		"why           Explain the scheduler state of a job",
+	)
+	printHelpSection("Launch and manage jobs",
+		"submit        Submit a raw JSON JobSpec",
+		"run           Submit an arbitrary command",
+		"train         Submit a built-in training recipe",
+		"finetune      Submit the built-in fine-tune recipe",
+		"logs          Fetch stdout or stderr for a job",
+		"cancel        Cancel a job",
+		"checkpoint    Trigger a checkpoint",
+		"checkpoints   List checkpoints for a job",
+	)
+	printHelpSection("Development and simulation",
+		"server        Run the local Fuse HTTP server",
+		"simulate      Apply fake scheduler actions such as add-node or kill-node",
+		"bench         Run local benchmark helpers",
+	)
+	printHelpSection("Examples",
+		"./fuse --faker",
+		"./fuse status --faker",
+		"./fuse jobs --addr http://127.0.0.1:9090",
+		"./fuse run --faker --name smoke --gpus 1 -- bash -lc 'nvidia-smi'",
+		"./fuse train --faker --example makemore --steps 200",
+		"./fuse logs --faker --job run-123",
+		"./fuse topo --faker --job run-123",
+		"./fuse help run",
+	)
+	printHelpSection("TUI discoverability",
+		"q or ctrl+c   Quit",
+		"tab           Move focus between panes",
+		"j k arrows    Scroll the active pane",
+		"g / G         Jump to the top or bottom of a list",
+		"/ or :        Open the command bar",
+		"r             Refresh immediately",
+		"?             Toggle the inline help footer",
+	)
+	printHelpSection("Command bar examples",
+		":nodes",
+		":jobs",
+		":events",
+		":refresh",
+		":help",
+		":quit",
+	)
+	printHelpSection("More help",
+		"fuse help status",
+		"fuse help run",
+		"fuse help train",
+		"fuse help topo",
+		"fuse help logs",
+		"fuse help server",
+	)
 }

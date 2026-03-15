@@ -54,3 +54,25 @@ func TestJobNeedsStateUpdateSkipsIdenticalPoll(t *testing.T) {
 		t.Fatal("expected identical reconcile poll to be skipped")
 	}
 }
+
+func TestHydrateJobRuntimeSuppressesExitCodeUntilTerminal(t *testing.T) {
+	job := domain.Job{State: domain.JobStateRunning}
+	attempt := domain.JobAttempt{
+		Attempt:    1,
+		Executor:   "slurm",
+		SlurmJobID: "1234",
+		NodeList:   []string{"node-1"},
+	}
+	exitCode := 0
+	attempt.ExitCode = &exitCode
+	applyAttemptRuntime(&job, attempt)
+	if job.ExitCode != nil {
+		t.Fatalf("exit code = %v, want nil for non-terminal job", *job.ExitCode)
+	}
+
+	job.State = domain.JobStateSucceeded
+	applyAttemptRuntime(&job, attempt)
+	if job.ExitCode == nil || *job.ExitCode != 0 {
+		t.Fatalf("exit code = %#v, want 0 for terminal job", job.ExitCode)
+	}
+}

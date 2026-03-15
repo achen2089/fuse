@@ -646,17 +646,26 @@ fuse teams
 # vision        8      8     0      0        1.00        340
 ```
 
-### Multi-node NCCL is now the live demo
+### Multi-node NCCL is the live cluster boundary
 
 ```bash
-# Slurm: rendezvous, NIC selection, rank layout, and retry logic are your problem
-# Fuse: discovery + fabric + sharding feed launch automatically
+# Today:
+#   Fuse owns discovery, topology reasoning, sharding plans, job identity, and state
+#   The current 2-node nanochat launcher is still manual Slurm
+# Next step:
+#   Fuse should synthesize the multi-node launcher itself
 
-fuse train --example nanochat --gpus 16
-# Detects the actual allocation shape
-# Keeps placement aligned with the actual topology
-# Sets rendezvous + NCCL env from topology
-# Warns if placement would force a slow fallback
+srun --immediate=120 -p priority \
+  --nodes=2 --ntasks=2 --ntasks-per-node=1 \
+  --gres=gpu:1 --mem=20G --cpus-per-task=4 --time=00:05:00 \
+  --container-image=$HOME/fuse-ngc-pytorch-2502.sqsh \
+  --container-mount-home \
+  bash -lc '
+    export NCCL_IB_DISABLE=1
+    export NCCL_SOCKET_IFNAME=enp71s0
+    export FUSE_RDZV=file:///mnt/sharefs/user44/nanochat-smoke-rdzv-${SLURM_JOB_ID}
+    python /mnt/sharefs/user44/fuse-workloads/nanochat_smoke.py --steps 20
+  '
 ```
 
 ---
@@ -667,11 +676,11 @@ Not proof-of-life. Real distributed work.
 
 **Real topology discovery.** Fuse reads the actual 16-GPU slice Slurm handed us. If it's a clean `2 x 8`, Fuse sees two NVLink islands and one IB hop. If it's fragmented, Fuse surfaces that immediately instead of hiding it behind device IDs.
 
-**Real distributed launch.** This is now a real 16-rank job: rendezvous, env injection, placement, and startup on actual hardware. For the current demo, that means a simple `nanochat` training path instead of a heavier finetuning stack.
+**Real distributed boundary.** The cluster path is real, and the current `2`-node `nanochat` probe is real, but the multi-node launcher is still manual Slurm today. That boundary is part of the honest MVP story.
 
 **Real auto-sharding.** `fuse shard` recommends against the live allocation, not a synthetic cluster. The recommendation can be checked against measured bandwidth and device topology on the spot.
 
-**Real checkpoint and recovery.** Kill a rank, drain a node, or force a restart path. Fuse should verify the latest checkpoint, explain the recovery decision, and bring the job back without manual batch-script surgery.
+**Real checkpoint and recovery direction.** Checkpoints, restart, and explanation are core parts of the product story, but the live demo should present them as partial surface plus next-step direction unless the exact path has been validated on the cluster first.
 
 **Real validation workflow.** `makemore` is the quick smoke path because it is tiny and easy to reason about. `nanochat` is the live distributed path because it is still minimal enough to debug in public while exercising real multi-node launch.
 
@@ -860,20 +869,21 @@ This is not separate from the scheduler story. It is part of the scheduler story
 
 ## Demo script (7 min)
 
+The more honest current run-of-show lives in `DEMO.md`. The table below is the high-level target shape and should be read with that boundary in mind.
+
 | Time | Beat | Show |
 |------|------|------|
 | 0:00 | "This is how I launch 16 GPUs today" | Distributed sbatch script. `torchrun`. Manual NCCL and rendezvous. |
 | 0:45 | "This is Fuse on the same allocation" | `fuse status`. `fuse fabric`. Real 16-GPU slice, not a fake cluster. |
 | 1:15 | Mental model | "Cluster → fabric → teams → jobs → models → checkpoints. Six primitives." |
 | 1:45 | Auto-sharding | `fuse shard --model llama-70b --gpus 16`. Topology-aware TP/PP/DP on the live slice. |
-| 2:30 | One-line distributed training | `fuse train --example nanochat --gpus 16`. Real loss curve. |
-| 3:15 | Doctor | `fuse doctor cluster` and `fuse doctor <job>`. Health, ECC, congestion, silent NCCL fallback. |
-| 4:00 | Failure drill | Kill a rank or drain a node. Checkpoint verified. Job requeued and resumed. |
-| 4:45 | Why + agent-safe control | `fuse why abc123 pending` and JSON control surfaces. Safe retries, explicit next actions. |
-| 5:15 | Fair-share | `fuse teams`. Show queued work and preemptable capacity inside the slice. |
-| 5:45 | Simulate beyond the slice | `fuse simulate --submit --model llama-405b --gpus 64`. Capacity planning. |
-| 6:15 | Boundary line | "Everything up to here ran on the real 16-GPU allocation. The last step used simulation for scale-out." |
-| 6:45 | Close | "Same Slurm cluster. 40 lines vs 1. Manual NCCL vs auto. Manual recovery vs checkpoint-aware restart. Real 16-GPU proof, then simulation where it belongs." |
+| 2:30 | Real Fuse-managed job | `fuse train --example makemore`. Then `fuse jobs`, `fuse why`, `fuse logs`. |
+| 3:15 | Real multi-GPU Fuse path | `fuse train --example nanochat --gpus 2 --steps 10 --hold 60`, then `fuse cancel`. |
+| 4:00 | Real distributed boundary | Manual `2`-node `nanochat` Slurm launcher with the staged NGC image. |
+| 4:45 | Why + agent-safe control | `fuse jobs --json`, `fuse why <job> --json`. Safe retries, explicit next actions, shared principal story. |
+| 5:30 | Simulate beyond the slice | `fuse simulate --kill-node n1` or `fuse simulate --add-nodes 4 --switch leaf-01`. |
+| 6:15 | Boundary line | "Everything up to here used the real cluster path. Simulation starts where the live slice ends." |
+| 6:45 | Close | "Same Slurm cluster, better AI-native orchestration surface. Real 16-GPU reasoning, real jobs, and a safer control path for humans and agents." |
 
 ---
 
@@ -902,10 +912,11 @@ This is not separate from the scheduler story. It is part of the scheduler story
 
 ---
 
-## Artifacts already built
+## Demo And Visual Assets
 
 | File | What |
 |------|------|
-| `fusion-tui.jsx` | TUI: status/nodes/jobs/topo/shard, GPU heatmap, terminal, events |
-| `fair-share-demo.jsx` | Interactive Fuse vs Slurm fair-share with utilization comparison |
-| `auto-sharding.jsx` | Model parallelism recommender, strategy ranking, YAML generation |
+| `DEMO.md` | Honest run-of-show for the current live demo |
+| `SLIDE.md` | Short deck source |
+| `PRESENTATION.md` | Longer messaging and Q&A planning doc |
+| `VISUALS.md` | Mermaid-ready visuals for Fuse vs Slurm, topology, Volcano, and multi-agent control |

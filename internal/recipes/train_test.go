@@ -43,15 +43,21 @@ func TestBuildTrainSpecForNanochatUsesTorchrun(t *testing.T) {
 	}
 }
 
-func TestBuildTrainSpecRejectsMultiNodeNanochat(t *testing.T) {
-	_, err := BuildTrainSpec(TrainInput{
+func TestBuildTrainSpecForMultiNodeNanochatUsesSrunLauncher(t *testing.T) {
+	spec, err := BuildTrainSpec(TrainInput{
 		Name:    "nanochat-demo",
 		Team:    "default",
 		Example: "nanochat",
 		GPUs:    16,
 	})
-	if err == nil {
-		t.Fatal("expected multi-node nanochat error")
+	if err != nil {
+		t.Fatalf("build train spec: %v", err)
+	}
+	if spec.Nodes != 2 || spec.Tasks != 2 || spec.TasksPerNode != 1 || spec.GPUsPerNode != 8 {
+		t.Fatalf("unexpected multinode layout: %#v", spec)
+	}
+	if !containsAll(spec.CommandOrRecipe, `srun --ntasks=2 --ntasks-per-node=1`, `torchrun --nnodes=2`, `--nproc-per-node=8`) {
+		t.Fatalf("unexpected multinode command: %s", spec.CommandOrRecipe)
 	}
 }
 

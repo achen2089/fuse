@@ -41,18 +41,21 @@ class TinyChatModel(nn.Module):
         return self.head(x)
 
 
-def maybe_init_dist(device: torch.device, timeout_s: int) -> DistInfo:
+def maybe_init_dist(use_cuda: bool, timeout_s: int) -> DistInfo:
     world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
     rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
     if world_size <= 1:
         return DistInfo(False, 1, 0, 0)
 
-    backend = "nccl" if device.type == "cuda" else "gloo"
+    backend = "nccl" if use_cuda else "gloo"
     init_method = os.environ.get("FUSE_RDZV", "env://")
-    if device.type == "cuda":
-        torch.cuda.set_device(0)
-        local_rank = 0
+    if use_cuda:
+        if local_rank >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} but only {torch.cuda.device_count()} CUDA devices are visible"
+            )
+        torch.cuda.set_device(local_rank)
     dist.init_process_group(
         backend=backend,
         init_method=init_method,
@@ -81,21 +84,22 @@ def main():
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    info = maybe_init_dist(device, args.timeout_s)
+    use_cuda = torch.cuda.is_available()
+    info = maybe_init_dist(use_cuda, args.timeout_s)
+    device = torch.device(f"cuda:{info.local_rank}" if use_cuda else "cpu")
 
     try:
         model = TinyChatModel(args.vocab_size, args.n_embd).to(device)
         if info.enabled:
             model = nn.parallel.DistributedDataParallel(
                 model,
-                device_ids=[0] if device.type == "cuda" else None,
+                device_ids=[info.local_rank] if use_cuda else None,
             )
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
         if info.rank == 0:
             print(
-                f"device={device} distributed={info.enabled} world_size={info.world_size} rank={info.rank} steps={args.steps}",
+                f"device={device} distributed={info.enabled} world_size={info.world_size} rank={info.rank} local_rank={info.local_rank} steps={args.steps}",
                 flush=True,
             )
 
