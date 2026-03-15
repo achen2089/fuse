@@ -1,6 +1,153 @@
 # Fuse
 
-**GPU-native job scheduler — topology-aware training, auto-sharding, and fair-share scheduling in a single binary.**
+**GPU-native job scheduler — topology-aware training, auto-sharding, fair-share scheduling, and agent-safe parallel control in a single binary.**
+
+## Current MVP Status
+
+Fuse is currently implemented as an **opinionated CLI and UX layer over Slurm**, shaped for both human operators and concurrent agents. For the current MVP, `fuse server` is only in scope for `--faker` simulation. We are not running a Fuse server or agent path on the real cluster.
+
+On the live cluster, multiple tools or agents may operate through the same shared Slurm principal, `user44`. That shared credential is only the transport layer. Fuse should carry logical actor identity, idempotency, and collision-avoidance above it.
+
+What is real today:
+
+- Local CLI state and command wrappers
+- Faker-based cluster discovery for demos and simulation
+- Optional local GPU discovery via `nvidia-smi`
+- Real workload submission through Slurm
+- `fuse submit`, `fuse run`, example-driven `fuse train`, `fuse shard`, `fuse logs`, `fuse why`, `fuse storage`, `fuse topo`, and `fuse simulate`
+- SSH-backed Slurm execution for the FluidStack cluster login node
+- Remote shared storage rooted at `/mnt/sharefs/user44` for workdirs, artifacts, and checkpoints
+
+What is in active scope for the `16 GPU` hackathon demo:
+
+- Slurm-backed `fuse status`, `fuse fabric`, and `fuse nodes`
+- Hardware-aware sharding-plan output via `fuse shard`
+- Single-node example launch flow through `fuse train`
+- Manual `2`-node `nanochat` path kept as plain Slurm until the multi-node launcher is real
+- `fuse doctor`, `fuse why`, and checkpoint/resume demo paths
+- `fuse teams` for quota / burst / fair-share storytelling
+- Agent-safe control surfaces for many agents sharing the same cluster principal: `--json`, idempotent retries, explicit next actions, and low-collision operator / agent workflows
+- Validation workloads kept intentionally simple: `makemore` for the fastest smoke path and `nanochat` for the live distributed run
+- Axolotl or LlamaFactory only if time remains after the simple path is stable
+- Local `fuse server --faker` plus `fuse simulate` for scale-out and failure stories beyond the live slice
+
+The rest of this README uses that hackathon-demo target surface. When there is a question about what is live on the real cluster versus local simulation, this section and the operations guide are the source of truth.
+
+What is not built yet:
+
+- Native Fuse executor
+- Cluster-resident Fuse server / agent workflow
+- Distributed control plane / Raft / HA
+- Remote agent mesh
+- Production-grade automatic recovery
+
+For the FluidStack hackathon, the current assumption is a **guaranteed 16-GPU slice** for the live path, with larger-cluster behavior shown through the faker and simulator.
+
+Example faker startup for the simulation path:
+
+```bash
+fuse server --faker
+```
+
+## Getting Started
+
+The canonical binary name is `fuse`.
+
+For a repo-local workflow:
+
+```bash
+make build
+./fuse --help
+./fuse --faker
+```
+
+For an installed workflow:
+
+```bash
+make install
+fuse --help
+fuse --faker
+```
+
+Compatibility note:
+
+- `./.bin/fuse-live` is a generated wrapper for older scripts and forwards to the canonical `./fuse` binary after `make build`.
+- Treat `./fuse` or installed `fuse` as the primary entrypoint.
+
+## Current Operational Surface
+
+Real cluster path:
+
+```bash
+ssh user44@184.34.82.180
+salloc -p priority --gpus=16 --time=04:00:00
+scontrol show hostnames "$SLURM_JOB_NODELIST"
+srun --ntasks-per-node=1 nvidia-smi topo -m
+```
+
+No `fuse server` runs on the cluster in this flow. The real path is Slurm-backed execution. `fuse server --faker` remains local-only for simulation and larger-than-live demos.
+
+The direct CLI now defaults to the current live SSH target: `user44@184.34.82.180`. Override it with `--ssh-host` or `FUSE_SSH_HOST` when needed.
+
+Submit an ad hoc real job through the Slurm-backed flow:
+
+```bash
+fuse run --gpus 1 --time 00:05:00 -- /bin/true
+fuse jobs
+fuse logs <job-id>
+fuse storage
+fuse topo --gpus 8
+fuse topo --job <job-id>
+```
+
+Use the higher-level workload and sharding sugar:
+
+```bash
+fuse shard --model llama-70b --gpus 16
+fuse train --example makemore --steps 80
+fuse train --example nanochat --gpus 2 --steps 10 --hold 60
+```
+
+What is validated on the live cluster right now:
+
+- `fuse shard --model llama-70b --gpus 16` returns a live B200-backed plan of `TP=8 PP=2 DP=1`
+- `fuse train --example makemore` submits and completes on the staged runtimes
+- `fuse train --example nanochat --gpus 2 --hold 60` launches a real `torchrun --standalone` job, reaches `RUNNING`, and cancels cleanly to `CANCELLED`
+- `fuse train --example axolotl-probe` is useful as a runtime probe, and currently fails on the staged NGC image because `axolotl` is not installed there
+
+Run the end-to-end live Fuse smoke with the validated public PyTorch image:
+
+```bash
+./scripts/fuse-smoke.sh
+```
+
+That path uses the local `fuse` binary, the default SSH target, submits one real GPU container job, and verifies `fuse jobs`, `fuse why`, and `fuse logs` against the same Fuse-managed job.
+
+Simulation path:
+
+```bash
+fuse server --faker
+fuse simulate --submit --model llama-405b --gpus 64
+```
+
+Submit a canonical JSON `JobSpec` file:
+
+```bash
+cat > job.json <<'EOF'
+{
+  "name": "smoke-json",
+  "team": "default",
+  "type": "run",
+  "command_or_recipe": "/bin/true",
+  "gpus": 1,
+  "cpus": 4,
+  "memory_mb": 16384,
+  "walltime": "00:05:00"
+}
+EOF
+
+fuse submit job.json
+```
 
 ---
 
@@ -11,6 +158,8 @@ Every GPU scheduler today was built for a world before large-scale AI training. 
 Fuse starts from a different question: **what would a job scheduler look like if GPUs, training runs, and model-aware scheduling were the design center — not an addon?**
 
 The answer has six primitives.
+
+And one operating stance: many humans and agents should be able to share one cluster principal and still operate safely in parallel.
 
 ---
 
@@ -257,7 +406,7 @@ Capacity planning meets chaos engineering. Run this before you buy hardware, bef
 
 ## The faker is a superpower
 
-Not just a dev tool. It's a capacity planner, a training ground, and a demo engine.
+Now that the core demo can run on 16 real GPUs, the faker shifts from core proof to support system: capacity planner, training ground, and demo engine for stories bigger than the live slice.
 
 ### Capacity planning
 
@@ -289,9 +438,42 @@ Run your AI ops scripts against the faker before they touch production. Replay r
 
 ---
 
-## Designed for humans and machines alike
+## Designed for humans and concurrent agents alike
 
-Not a protocol. Not a plugin. Just design decisions that make every interaction structured, explained, and predictable.
+Not a protocol. Not a plugin. Just design decisions that make every interaction structured, explained, predictable, and safer under concurrent control.
+
+This is a product wedge, not a side-effect. As more teams use agents for triage, launch, recovery, and cluster hygiene, the scheduler has to be legible and low-collision under concurrent automation.
+
+### Many agents, one cluster principal
+
+On this cluster, the shared SSH and Slurm identity is `user44`. That is fine. The Unix username is the transport credential, not the real identity model. Fuse should let multiple agents operate in parallel under that shared principal while still carrying actor IDs, request IDs, and coordination state above it.
+
+### Agent-safe scheduling
+
+The bar is not "an agent can call the CLI." The bar is "multiple humans and agents can inspect, submit, retry, and recover work on the same cluster without colliding."
+
+Current building blocks:
+
+- `--json` output on the main control surfaces
+- `possible_actions` on resources so agents do not guess valid next steps
+- Idempotent retry semantics on mutating actions
+- Per-action metadata so the real actor can be tracked even when the transport credential is shared
+- `fuse why` and `fuse snapshot` for inspectability instead of regex-parsing cluster text
+
+Why this matters:
+
+- Slurm-style text interfaces force agents to parse unstable output
+- Retry often means duplicate submission instead of safe replay
+- Two automations can act on stale reads without any explicit precondition checks
+- Humans have weak visibility into which automated system made which decision
+- If only one agent can safely act at a time, the scheduler stays under-utilized
+
+Primitives to harden next:
+
+- Stable job keys to deduplicate submission across parallel agents
+- Resource versions and preconditions on mutating actions
+- Short-lived leases or claims for long-running orchestration steps
+- Clear ownership and audit history by actor and request, not just by Unix user
 
 ### Every command speaks JSON
 
@@ -356,6 +538,10 @@ fuse train --model llama-70b --gpus 4
 # Alt: fuse finetune --model llama-70b --method lora --gpus 4  (LoRA = 2 GB trainable)
 ```
 
+### Collision avoidance is a feature
+
+Most "agent support" stories are really just automation wrappers over brittle text commands. Fuse should be better than that. If two agents share the same cluster credential and both try to act, the system should bias toward safe retries, explicit preconditions, leases, and clean failures instead of duplicate jobs or accidental interference.
+
 ### `fuse cost` — know what you're spending
 
 ```bash
@@ -375,57 +561,72 @@ fuse cost --team ml-research --period 7d
 
 ## The Slurm side-by-side
 
-We're on a real Slurm cluster as `user44` (QOS `restricted_limit`, 1 GPU, 200G). The demo runs both schedulers on the same allocation.
+We're on a real Slurm cluster with a 16-GPU allocation. That changes the proof. Fuse is no longer showing "1 real GPU plus a fake cluster." The live path is a real distributed workflow inside a real slice of the cluster, and that path does **not** run `fuse server` on the cluster. The simulator still matters, but it moves to the scale-out and chaos-planning part of the story.
 
 ```bash
-# Get resources from Slurm (the normal way)
-salloc --gres=gpu:1 --mem=200G --cpus-per-task=20 --time=04:00:00
+# Ask Slurm for the arena we actually care about
+salloc -p priority --gpus=16 --time=04:00:00
 
-# Start Fuse on the allocated node
-fuse server --faker --port 9090 &
-fuse agent --server localhost:9090 --discover nvidia
-# 5 seconds. 65 GPUs (64 fake + 1 real). Full topology.
+# Check what shape Slurm actually gave us
+scontrol show hostnames "$SLURM_JOB_NODELIST"
+srun --ntasks-per-node=1 nvidia-smi topo -m
+
+# No Fuse daemon runs on this allocation for the current MVP.
+# Discovery and placement logic are driven from Slurm-visible topology and local simulation data.
+# Best case: 2 x 8-GPU nodes with NVLink inside each node and IB between them.
+# If the slice is fragmented, Fuse says so immediately and plans around it.
 ```
 
-### 28 lines vs 1 line
+### Distributed launch: 40 lines vs 1 line
 
 ```bash
 # ═══ SLURM ═══                          # ═══ FUSE ═══
 
-cat << 'EOF' > finetune.sbatch           fuse finetune \
-#!/bin/bash                                --model llama-7b \
-#SBATCH --job-name=llama-7b-lora           --method lora \
-#SBATCH --gres=gpu:1                       --data ./alpaca.json \
-#SBATCH --mem=50G                          --gpus 1
-#SBATCH --cpus-per-task=4
-#SBATCH --time=01:00:00                  # That's it.
-#SBATCH --output=logs/llama-ft-%j.out    # Logs stream automatically.
-#SBATCH --error=logs/llama-ft-%j.err     # Checkpoint auto-configured.
-                                         # NCCL env auto-detected.
-module load cuda/12.2                    # Failure → auto-recovery.
+cat << 'EOF' > nanochat.sbatch           fuse train \
+#!/bin/bash                                --example nanochat \
+#SBATCH --job-name=nanochat-demo           --repo karpathy/nanochat \
+#SBATCH --nodes=2                          --gpus 16 \
+#SBATCH --gpus-per-node=8                  --gpus 16
+#SBATCH --cpus-per-gpu=8                   --checkpoint-every 300s
+#SBATCH --mem=0                            # That's it.
+#SBATCH --time=02:00:00                    # Topology inferred.
+#SBATCH --output=logs/%x-%j.out            # Logs stream automatically.
+#SBATCH --error=logs/%x-%j.err             # Checkpoint wiring included.
+                                           # Rendezvous + NCCL auto-set.
+module load cuda/13.1                      # Failure → auto-recovery.
 module load nccl
 source activate train
 
-export CUDA_VISIBLE_DEVICES=0
+MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+MASTER_PORT=29500
+
 export NCCL_DEBUG=INFO
-export NCCL_IB_DISABLE=1
-export NCCL_SOCKET_IFNAME=eth0
-export OMP_NUM_THREADS=4
+export NCCL_IB_HCA=mlx5_0,mlx5_1
+export NCCL_SOCKET_IFNAME=ib0
+export NCCL_NET_GDR_LEVEL=5
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export OMP_NUM_THREADS=8
 export TOKENIZERS_PARALLELISM=false
 
-python finetune.py \
-  --model_name meta-llama/Llama-2-7b-hf \
-  --dataset ./alpaca.json \
-  --output_dir ./checkpoints \
-  --per_device_batch_size 4 \
-  --learning_rate 2e-4 \
-  --num_train_epochs 1 \
-  --lora_r 16 \
-  --lora_alpha 32 \
-  --bf16
+srun bash ./demo/run-nanochat.sh \
+  --nnodes="$SLURM_JOB_NUM_NODES" \
+  --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  --checkpoint_every=100
 EOF
 mkdir -p logs
-sbatch finetune.sbatch
+sbatch nanochat.sbatch
+```
+
+### Validation path stays simple
+
+```bash
+# Fastest smoke path
+python makemore.py -i names.txt -o names-demo
+
+# Live distributed demo path
+# keep it minimal and readable with nanochat on the real 16-GPU slice
 ```
 
 ### Fair-share: `sshare` vs `fuse teams`
@@ -445,53 +646,56 @@ fuse teams
 # vision        8      8     0      0        1.00        340
 ```
 
-### Multi-node NCCL (if 2 nodes approved)
+### Multi-node NCCL is now the live demo
 
 ```bash
-# Slurm: 40 lines of sbatch with manual NCCL flags
-# MASTER_ADDR=$(scontrol show hostnames ... | head -n 1)  ← incantation
-# export NCCL_IB_HCA=mlx5_0:1    ← which HCA? run ibstat
-# export NCCL_NET_GDR_LEVEL=5    ← GPUDirect? read docs
-# export NCCL_SOCKET_IFNAME=ib0  ← which interface? guess
-# (wrong value = silent 10× slowdown, no warning)
+# Slurm: rendezvous, NIC selection, rank layout, and retry logic are your problem
+# Fuse: discovery + fabric + sharding feed launch automatically
 
-# Fuse:
-fuse train --model llama-7b --nodes 2
-# NCCL auto-configured from PCIe affinity. Warns if fallback to TCP.
+fuse train --example nanochat --gpus 16
+# Detects the actual allocation shape
+# Keeps placement aligned with the actual topology
+# Sets rendezvous + NCCL env from topology
+# Warns if placement would force a slow fallback
 ```
 
 ---
 
-## What the 1 real GPU does
+## What the 16 real GPUs do
 
-Not proof-of-life. Real work.
+Not proof-of-life. Real distributed work.
 
-**Real fine-tune.** LoRA fine-tune of Llama-7B. Full pipeline: NVML discovery → sharding → dispatch → env injection → training with loss curves → auto-checkpoint → completion. ~10 min. Crowd watches real loss go down.
+**Real topology discovery.** Fuse reads the actual 16-GPU slice Slurm handed us. If it's a clean `2 x 8`, Fuse sees two NVLink islands and one IB hop. If it's fragmented, Fuse surfaces that immediately instead of hiding it behind device IDs.
 
-**Real inference.** `fuse serve` loads the model. Health endpoint, request handling. Send prompts, get completions. Kill the process — watch auto-restart.
+**Real distributed launch.** This is now a real 16-rank job: rendezvous, env injection, placement, and startup on actual hardware. For the current demo, that means a simple `nanochat` training path instead of a heavier finetuning stack.
 
-**Real benchmarks.** `fuse bench` profiles the GPU: BF16 TFLOPS, memory bandwidth. Numbers feed into the sharding recommender. "Fuse measured YOUR hardware."
+**Real auto-sharding.** `fuse shard` recommends against the live allocation, not a synthetic cluster. The recommendation can be checked against measured bandwidth and device topology on the spot.
 
-**Real eval sweep.** `fuse eval --sweep` queues 5 evals, runs back-to-back, collects results.
+**Real checkpoint and recovery.** Kill a rank, drain a node, or force a restart path. Fuse should verify the latest checkpoint, explain the recovery decision, and bring the job back without manual batch-script surgery.
 
-**Hybrid cluster.** Real GPU joins the faker as node-09. Scheduler treats it identically. Real node shows live metrics, fakes show simulated data. Same dashboard, same API.
+**Real validation workflow.** `makemore` is the quick smoke path because it is tiny and easy to reason about. `nanochat` is the live distributed path because it is still minimal enough to debug in public while exercising real multi-node launch.
+
+**Simulated scale-out.** The faker still matters, but now for the stories that exceed the live slice: rack failures, 64-GPU planning, and alternate cluster shapes.
 
 ---
 
 ## Auto-sharding
 
 ```bash
-fuse shard --model llama-70b --nodes 2
+fuse shard --model llama-70b --gpus 16
 
+# On a clean 2 x 8-GPU slice:
 # Recommended: TP=8 PP=2 DP=1
-#   TP=8 within node → NVLink 900 GB/s (64 heads ÷ 8 = 8 heads/GPU)
-#   PP=2 across nodes → IB 50 GB/s (80 layers ÷ 2 = 40 layers/stage)
+#   TP=8 stays inside each node's NVLink island
+#   PP=2 crosses the IB link once
 #   Memory/GPU: 43.2 / 80 GB (54%)
 #   Bubble: 50%
 #
-# Alternative: TP=8 PP=1 DP=2 (no bubble, 71% util, grad sync over IB)
+# Alternative: TP=8 PP=1 DP=2
+#   Better pipeline efficiency, more gradient sync over IB
 #
-# Bench data: node-09 measured at 312 BF16 TFLOPS, 1.8 TB/s mem BW
+# Bench data: calibrated from the live allocation with `fuse bench`
+# If the slice is fragmented, Fuse explains the constraint and suggests the next-best plan
 
 fuse shard --model llama-405b --nodes 8
 # → TP=8 PP=4 DP=2 (810 GB model, needs 4+ PP stages)
@@ -505,40 +709,35 @@ Logic: memory budget → TP sized to NVLink domain and attention heads → PP mi
 
 ```
 ╭─ fuse ──────────────────────────────────────────────╮
-│  9 nodes  65 GPUs  49 alloc  16 idle  0 dead        │
-│  6 running  3 pending  1 serving                     │
+│  2 nodes  16 GPUs  16 alloc  0 idle  0 dead         │
+│  1 running  1 pending  1 recovering                  │
 ╰─────────────────────────────────────────────────────╯
 
-  n1  [████████]  8/8  llama-train (ml-research)     47°C
-  n2  [████████]  8/8  llama-train (ml-research)     45°C
-  n3  [████░░░░]  4/8  eval-mmlu (nlp)               38°C
-  n4  [░░░░░░░░]  0/8  idle
-  n5  [████████]  8/8  vit-pretrain (vision)          52°C
-  n6  [████████]  8/8  bert-ft (nlp) [burst]          49°C
-  n7  [████████]  8/8  bert-ft (nlp) [burst]          48°C
-  n8  [░░░░░░░░]  0/8  idle
-  n9  [█░░░░░░░]  1/1  llama-7b-serve ★ REAL          61°C
+  n1  [████████]  8/8  nanochat-demo rank 0-7        47°C
+  n2  [████████]  8/8  nanochat-demo rank 8-15       45°C
 
-  14:23  → llama-train: n1,n2 (same_switch, TP=8 PP=2 auto-sharded)
-  14:38  ↗ bert-ft: burst on n6,n7 (ml-research idle capacity)
-  14:50  ★ bench n9: 312 BF16 TFLOPS, 1.8 TB/s
-  15:02  ⚡ bert-ft preempted → ckpt step-4800 → requeued
-  15:07  ✗ n9 GPU crash → llama-7b-serve restarted (10s)
+  14:23  → nanochat-demo: n1,n2 (topology-aware placement)
+  14:31  ★ bench n1,n2: live topology calibrated
+  14:52  ✗ rank 11 lost heartbeat → ckpt step-4800 verified
+  15:01  ↻ nanochat-demo resumed on healthy devices
+  15:10  … eval-mmlu queued (needs 4 GPUs, waiting on preemptable capacity)
 ```
 
 ---
 
 ## The full CLI
 
+The examples below mix the live CLI and the target hackathon surface. Today, `fuse train` is real for staged single-node examples like `makemore`, `nanochat`, and `axolotl-probe`; the multi-node `nanochat --gpus 16` form remains the intended next step, not a completed live launcher.
+
 ### Workload verbs
 
 ```bash
-fuse train     --model llama-70b --nodes 2 --data /pile
-fuse finetune  --model llama-7b --method lora --data ./alpaca.json --gpus 1
+fuse train     --example nanochat --gpus 16
+fuse run       --gpus 1 -- python makemore.py -i names.txt -o names-demo
 fuse serve     --model llama-7b --gpus 1 --engine vllm --port 8000
-fuse eval      --model llama-7b --gpus 1 --sweep --param benchmark=mmlu,arc,hellaswag
+fuse eval      --model llama-7b --gpus 4 --sweep --param benchmark=mmlu,arc,hellaswag
 fuse bench     --type compute     # or: nccl, memory, health
-fuse run       --gpus 1           # interactive shell with GPU
+fuse run       --gpus 8           # interactive shell inside the allocation
 ```
 
 ### Introspection
@@ -560,7 +759,7 @@ fuse cost <job|--team T>        # GPU-hours, efficiency, estimated cost
 ### Intelligence
 
 ```bash
-fuse shard     --model llama-70b --nodes 2     # sharding recommender
+fuse shard     --model llama-70b --gpus 16     # sharding recommender
 fuse doctor    cluster                          # cluster health diagnosis
 fuse doctor    <job>                            # job performance diagnosis
 fuse why       <job> pending                    # explain scheduling decision
@@ -579,7 +778,7 @@ fuse checkpoint <job>           # trigger immediate checkpoint
 fuse priority <job> high        # bump priority
 fuse drain <node>               # graceful drain
 fuse undrain <node>             # bring back
-fuse kill-node <node>           # simulate failure (faker)
+fuse kill-node <node>           # simulate failure / recovery drill
 fuse team create <n> --quota N  # new team
 fuse model register <n> --params P --layers L --heads H  # custom model
 ```
@@ -591,13 +790,18 @@ fuse model register <n> --params P --layers L --heads H  # custom model
 ```
 fuse
 ├── cmd/
-│   ├── server.go         # control plane
-│   ├── agent.go          # node agent
-│   └── cli.go            # all commands
+│   ├── cli.go            # all commands
+│   └── server.go         # faker-only simulation server
 ├── pkg/
+│   ├── slurm/            # sbatch/squeue/sacct/scancel wrappers
+│   ├── ssh/              # login-node transport
+│   ├── faker/            # simulated cluster for demos
+│   ├── state/            # local state, resource versions, idempotency keys
+│   ├── leases/           # action claims, ownership, collision avoidance
 │   ├── scheduler/        # gang + bin-packing + topology
 │   ├── fabric/           # switch graph, bandwidth tiers
-│   ├── discovery/        # faker + nvidia (NVML)
+│   ├── discovery/        # slurm allocation + nvidia (NVML)
+│   ├── launch/           # rendezvous, env injection, distributed start
 │   ├── jobs/             # state machine, job types
 │   ├── models/           # model registry, profiles
 │   ├── checkpoints/      # tracking, verification, GC
@@ -617,29 +821,40 @@ fuse
 
 | Hour | What | Done when |
 |------|------|-----------|
-| 0–1 | Server + faker + `status`/`fabric`/`nodes` | `fuse server --faker` boots on salloc node |
-| 1–3 | Scheduler + job lifecycle + `fuse train` | Job → topology placement → RUNNING → COMPLETED |
-| 3–4 | `fuse shard` + `fuse bench` on real GPU | Shard recommends. Bench reports real TFLOPS. |
-| 4–5 | Real fine-tune + `fuse serve` on real GPU | LoRA runs, model served, prompts answered |
-| 5–6 | `fuse doctor` + `fuse why` + Slurm comparison | Diagnostics work. Side-by-side sbatch vs fuse. |
-| 6–7 | Faker simulate + fault injection + rehearsal | `fuse simulate --kill`. Practice 7-min demo. |
+| 0–1 | Slurm bootstrap + real discovery + `status`/`fabric`/`nodes` | Fuse sees the actual 16-GPU allocation |
+| 1–3 | Distributed launcher + scheduler + `fuse train` | 16-rank job is placed and RUNNING without a cluster-resident Fuse daemon |
+| 3–4 | `fuse shard` + `fuse bench` on the live slice | Shard reflects measured topology |
+| 4–5 | Real 16-GPU `nanochat` run + checkpoints | Loss moves, checkpoints land, resume works |
+| 5–6 | `fuse doctor` + `fuse why` + failure drill | Diagnostics explain a real interruption |
+| 6–7 | Local faker for >16 GPUs + rehearsal | `fuse server --faker` and `fuse simulate` cover rack fail / 64-GPU cases |
 
 ### Cut list (drop from bottom)
 
-1. Server + faker + CLI — **must ship**
-2. Scheduler with fabric awareness — **must ship**
-3. Job state machine with types — **must ship**
-4. `fuse bench` on real GPU
-5. `fuse shard` + model registry
-6. `fuse train` / `fuse finetune` on real GPU
-7. `fuse doctor` + `fuse why`
-8. `fuse serve` on real GPU
-9. TUI (React artifacts as fallback)
-10. `fuse simulate` (dry-run failures, capacity planning)
-11. `fuse cost`
-12. Slurm side-by-side
-13. `fuse snapshot --json`
-14. Checkpoint tracking + GC
+1. Slurm bootstrap + real discovery — **must ship**
+2. Distributed launcher + scheduler — **must ship**
+3. Job state machine + checkpoints — **must ship**
+4. `fuse shard` + model registry
+5. `fuse doctor` + `fuse why`
+6. Failure drill + recovery on the live slice
+7. Slurm side-by-side
+8. `fuse bench`
+9. Local faker + `fuse simulate` (dry-run failures, capacity planning)
+10. Fair-share demo inside the slice
+11. `fuse serve`
+12. TUI (React artifacts as fallback)
+13. `fuse cost`
+14. `fuse snapshot --json`
+
+### Cross-cutting requirement: agent-safe ops
+
+- Stable job identity so retries and duplicate submissions collapse cleanly
+- Idempotent mutating actions wherever retry is expected
+- Resource versions or preconditions so stale agents fail safely
+- Actor and request identity above the shared `user44` cluster principal
+- `--json`, `possible_actions`, `fuse why`, and `fuse snapshot` as the inspection surface
+- Clear event history so humans can see which agent or operator acted
+
+This is not separate from the scheduler story. It is part of the scheduler story. If Fuse is supposed to be the control plane for AI work, it needs to stay coherent when humans, scripts, and multiple agents all touch the same cluster.
 
 ---
 
@@ -647,18 +862,18 @@ fuse
 
 | Time | Beat | Show |
 |------|------|------|
-| 0:00 | "This is how I train today" | sbatch script. 28 lines. squeue. sprio gibberish. |
-| 0:45 | "This is Fuse" | `fuse server --faker`. 5 sec. `fuse status`. `fuse fabric`. TUI. |
+| 0:00 | "This is how I launch 16 GPUs today" | Distributed sbatch script. `torchrun`. Manual NCCL and rendezvous. |
+| 0:45 | "This is Fuse on the same allocation" | `fuse status`. `fuse fabric`. Real 16-GPU slice, not a fake cluster. |
 | 1:15 | Mental model | "Cluster → fabric → teams → jobs → models → checkpoints. Six primitives." |
-| 1:45 | One-liner fine-tune | `fuse finetune --model llama-7b --method lora --gpus 1`. Real loss curve. |
-| 2:30 | Auto-sharding | `fuse shard --model llama-70b --nodes 2`. Topology-aware TP/PP/DP. |
-| 3:15 | Doctor | `fuse doctor cluster`. Health, ECC, congestion, silent NCCL fallback. |
-| 4:00 | Why | `fuse why abc123 pending`. Explained decision with suggestions. |
-| 4:30 | Fair-share | `fuse teams`. Burst. Preemption. Compare to sshare. |
-| 5:15 | Simulate | `fuse simulate --kill-rack rack-01`. Dry-run failure. Capacity planning. |
-| 5:45 | Real serve | `fuse serve --model llama-7b`. Prompt → completion. Kill → auto-restart. |
-| 6:15 | Fault recovery | Kill fake node in TUI. 30-second cascade. |
-| 6:45 | Close | "Same Slurm cluster. 28 lines vs 1. Manual NCCL vs auto. Cryptic errors vs fuse doctor. Debugging failures vs 30-second recovery. Six primitives that make sense." |
+| 1:45 | Auto-sharding | `fuse shard --model llama-70b --gpus 16`. Topology-aware TP/PP/DP on the live slice. |
+| 2:30 | One-line distributed training | `fuse train --example nanochat --gpus 16`. Real loss curve. |
+| 3:15 | Doctor | `fuse doctor cluster` and `fuse doctor <job>`. Health, ECC, congestion, silent NCCL fallback. |
+| 4:00 | Failure drill | Kill a rank or drain a node. Checkpoint verified. Job requeued and resumed. |
+| 4:45 | Why + agent-safe control | `fuse why abc123 pending` and JSON control surfaces. Safe retries, explicit next actions. |
+| 5:15 | Fair-share | `fuse teams`. Show queued work and preemptable capacity inside the slice. |
+| 5:45 | Simulate beyond the slice | `fuse simulate --submit --model llama-405b --gpus 64`. Capacity planning. |
+| 6:15 | Boundary line | "Everything up to here ran on the real 16-GPU allocation. The last step used simulation for scale-out." |
+| 6:45 | Close | "Same Slurm cluster. 40 lines vs 1. Manual NCCL vs auto. Manual recovery vs checkpoint-aware restart. Real 16-GPU proof, then simulation where it belongs." |
 
 ---
 
@@ -666,7 +881,7 @@ fuse
 
 | | Slurm | K8s + Volcano | Fuse |
 |---|---|---|---|
-| **Fine-tune** | 28-line sbatch | Helm chart + CRD | `fuse finetune --model X` |
+| **Train** | 40-line distributed sbatch | Helm chart + CRD | `fuse train --example nanochat` |
 | **Serve** | sbatch + systemd | Deployment + Service + HPA | `fuse serve --model X` |
 | **Topology** | `--switches` (broken) | None | Fabric: bandwidth-weighted graph |
 | **Sharding** | Researcher guesses | Researcher guesses | Auto: TP/PP/DP from fabric + model |
@@ -679,6 +894,7 @@ fuse
 | **Explain decisions** | `(Priority)` | `Pending: 0/1 nodes available` | `fuse why` with suggestions |
 | **Structured output** | No (flat text) | YAML (verbose) | `--json` on everything |
 | **Idempotent** | No (sbatch twice = 2 jobs) | Yes (apply) | Yes (submit twice = same job) |
+| **Agent friendliness** | Caller-managed, race-prone text CLI | API-level concurrency, pod-centric | Structured state, safer retries, explicit next actions, lower collision risk |
 | **Models** | Not a concept | Not a concept | First-class with requirements |
 | **Checkpoints** | Not a concept | Not a concept | First-class, tracked, verified |
 | **Cost tracking** | sacct (wall time only) | N/A | GPU-hours, efficiency, bubble waste |
