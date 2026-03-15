@@ -239,6 +239,8 @@ func main() {
 			}
 			return nil
 		})
+	case "doctor":
+		withClient(ctx, os.Args[2:], runDoctor)
 	case "cancel":
 		withClient(ctx, os.Args[2:], func(ctx context.Context, cli cliAPI, args []string, _ bool) error {
 			fs := flag.NewFlagSet("cancel", flag.ExitOnError)
@@ -839,6 +841,362 @@ func showShard(ctx context.Context, cli cliAPI, args []string, jsonOut bool) err
 		fmt.Printf("suggestion: %s\n", suggestion)
 	}
 	return nil
+}
+
+type doctorCheck struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Summary string `json:"summary"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+type doctorReport struct {
+	Scope       string        `json:"scope"`
+	Target      string        `json:"target"`
+	Status      string        `json:"status"`
+	Summary     string        `json:"summary"`
+	Checks      []doctorCheck `json:"checks"`
+	Suggestions []string      `json:"suggestions,omitempty"`
+}
+
+const (
+	doctorStatusOK   = "ok"
+	doctorStatusWarn = "warn"
+	doctorStatusFail = "fail"
+)
+
+func runDoctor(ctx context.Context, cli cliAPI, args []string, jsonOut bool) error {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	jobID := fs.String("job", "", "fuse job id or job name")
+	storagePath := fs.String("storage-path", envOrDefaultString("FUSE_DOCTOR_STORAGE_PATH", "/mnt/sharefs"), "filesystem path for cluster storage checks")
+	_ = fs.Parse(args)
+
+	scope := "cluster"
+	target := ""
+	switch {
+	case *jobID != "":
+		scope = "job"
+		target = *jobID
+	case fs.NArg() == 0:
+		scope = "cluster"
+		target = "cluster"
+	case fs.Arg(0) == "cluster":
+		scope = "cluster"
+		target = "cluster"
+	case fs.Arg(0) == "job":
+		if fs.NArg() < 2 {
+			return fmt.Errorf("job id is required")
+		}
+		scope = "job"
+		target = fs.Arg(1)
+	default:
+		scope = "job"
+		target = fs.Arg(0)
+	}
+
+	var (
+		report doctorReport
+		err    error
+	)
+	if scope == "cluster" {
+		report = diagnoseCluster(ctx, cli, *storagePath)
+	} else {
+		report, err = diagnoseJob(ctx, cli, target)
+		if err != nil {
+			return err
+		}
+	}
+	if jsonOut {
+		return printJSON(report)
+	}
+	printDoctorReport(report)
+	return nil
+}
+
+func diagnoseCluster(ctx context.Context, cli cliAPI, storagePath string) doctorReport {
+	report := doctorReport{
+		Scope:  "cluster",
+		Target: "cluster",
+	}
+	status, statusErr := cli.Status(ctx)
+	if statusErr != nil {
+		report.Checks = append(report.Checks, doctorCheck{
+			Name:    "inventory",
+			Status:  doctorStatusFail,
+			Summary: "cluster summary unavailable",
+			Detail:  statusErr.Error(),
+		})
+	} else {
+		checkStatus := doctorStatusOK
+		summary := fmt.Sprintf("%d nodes and %d GPUs visible", status.Nodes, status.Devices)
+		detail := fmt.Sprintf("allocated=%d idle=%d running=%d pending=%d failed=%d", status.Allocated, status.Idle, status.RunningJobs, status.PendingJobs, status.FailedJobs)
+		switch {
+		case status.Nodes <= 0 || status.Devices <= 0:
+			checkStatus = doctorStatusFail
+			summary = "no cluster capacity discovered"
+		case status.Devices < defaultGuaranteedGPUs:
+			checkStatus = doctorStatusWarn
+			summary = fmt.Sprintf("only %d GPUs visible; expected at least %d", status.Devices, defaultGuaranteedGPUs)
+		}
+		report.Checks = append(report.Checks, doctorCheck{
+			Name:    "inventory",
+			Status:  checkStatus,
+			Summary: summary,
+			Detail:  detail,
+		})
+		if checkStatus != doctorStatusOK {
+			report.Suggestions = append(report.Suggestions, "verify Slurm discovery with `fuse status` and `fuse nodes`")
+		}
+		jobCheckStatus := doctorStatusOK
+		jobSummary := "no failed Fuse-managed jobs"
+		jobDetail := fmt.Sprintf("running=%d pending=%d failed=%d", status.RunningJobs, status.PendingJobs, status.FailedJobs)
+		if status.FailedJobs > 0 {
+			jobCheckStatus = doctorStatusWarn
+			jobSummary = fmt.Sprintf("%d Fuse-managed jobs are in FAILED state", status.FailedJobs)
+			report.Suggestions = append(report.Suggestions, "use `fuse jobs` and `fuse why <job>` to inspect failed jobs")
+		}
+		report.Checks = append(report.Checks, doctorCheck{
+			Name:    "jobs",
+			Status:  jobCheckStatus,
+			Summary: jobSummary,
+			Detail:  jobDetail,
+		})
+	}
+
+	nodes, _, nodesErr := cli.Nodes(ctx)
+	if nodesErr != nil {
+		report.Checks = append(report.Checks, doctorCheck{
+			Name:    "nodes",
+			Status:  doctorStatusFail,
+			Summary: "node health unavailable",
+			Detail:  nodesErr.Error(),
+		})
+	} else {
+		var unhealthy []string
+		for _, node := range nodes {
+			state := strings.ToLower(strings.TrimSpace(node.ObservedState))
+			if node.Health != domain.HealthHealthy || strings.Contains(state, "drain") || strings.Contains(state, "down") || strings.Contains(state, "fail") {
+				unhealthy = append(unhealthy, node.Name)
+			}
+		}
+		checkStatus := doctorStatusOK
+		summary := "all discovered nodes look healthy"
+		detail := fmt.Sprintf("checked %d nodes", len(nodes))
+		if len(unhealthy) > 0 {
+			checkStatus = doctorStatusWarn
+			summary = fmt.Sprintf("%d nodes look unhealthy, drained, or offline", len(unhealthy))
+			detail = strings.Join(unhealthy, ", ")
+		}
+		report.Checks = append(report.Checks, doctorCheck{
+			Name:    "nodes",
+			Status:  checkStatus,
+			Summary: summary,
+			Detail:  detail,
+		})
+		if checkStatus != doctorStatusOK {
+			report.Suggestions = append(report.Suggestions, "check drained or offline nodes with `fuse nodes` and Slurm node status tools")
+		}
+	}
+
+	storage, storageErr := cli.Storage(ctx, storagePath)
+	if storageErr != nil {
+		report.Checks = append(report.Checks, doctorCheck{
+			Name:    "storage",
+			Status:  doctorStatusWarn,
+			Summary: "shared storage check failed",
+			Detail:  storageErr.Error(),
+		})
+	} else {
+		checkStatus := doctorStatusWarn
+		summary := fmt.Sprintf("no filesystem records returned for %s", storagePath)
+		detail := ""
+		if len(storage.Filesystems) > 0 {
+			fs := storage.Filesystems[0]
+			checkStatus = doctorStatusOK
+			summary = fmt.Sprintf("%s free on %s (%d%% used)", humanBytes(fs.AvailableBytes), fs.Target, fs.UsePercent)
+			detail = fmt.Sprintf("size=%s used=%s source=%s", humanBytes(fs.SizeBytes), humanBytes(fs.UsedBytes), fs.Source)
+			switch {
+			case fs.UsePercent >= 95 || fs.AvailableBytes < 100*1024*1024*1024:
+				checkStatus = doctorStatusFail
+				summary = fmt.Sprintf("storage is critically low on %s", fs.Target)
+			case fs.UsePercent >= 85 || fs.AvailableBytes < 1024*1024*1024*1024:
+				checkStatus = doctorStatusWarn
+				summary = fmt.Sprintf("storage headroom is getting tight on %s", fs.Target)
+			}
+		}
+		report.Checks = append(report.Checks, doctorCheck{
+			Name:    "storage",
+			Status:  checkStatus,
+			Summary: summary,
+			Detail:  detail,
+		})
+		if checkStatus != doctorStatusOK {
+			report.Suggestions = append(report.Suggestions, "free space under the shared storage path before launching more jobs")
+		}
+	}
+
+	finalizeDoctorReport(&report)
+	return report
+}
+
+func diagnoseJob(ctx context.Context, cli cliAPI, target string) (doctorReport, error) {
+	jobs, err := cli.Jobs(ctx)
+	if err != nil {
+		return doctorReport{}, err
+	}
+	job, found := findDoctorJob(jobs, target)
+	if !found {
+		return doctorReport{}, fmt.Errorf("job %q not found", target)
+	}
+	why, err := cli.Why(ctx, job.ID)
+	if err != nil {
+		return doctorReport{}, err
+	}
+	checkpoints, err := cli.Checkpoints(ctx, job.ID)
+	if err != nil {
+		return doctorReport{}, err
+	}
+	report := doctorReport{
+		Scope:  "job",
+		Target: job.ID,
+	}
+
+	stateStatus := doctorStatusOK
+	switch why.CurrentState {
+	case domain.JobStateFailed:
+		stateStatus = doctorStatusFail
+	case domain.JobStatePending, domain.JobStateCancelling, domain.JobStateCancelled:
+		stateStatus = doctorStatusWarn
+	}
+	stateDetail := why.Detail
+	if why.ExitCode != nil {
+		stateDetail = fmt.Sprintf("%s (exit_code=%d)", stateDetail, *why.ExitCode)
+	}
+	report.Checks = append(report.Checks, doctorCheck{
+		Name:    "state",
+		Status:  stateStatus,
+		Summary: why.Summary,
+		Detail:  stateDetail,
+	})
+
+	placementStatus := doctorStatusOK
+	placementSummary := "node placement is visible"
+	placementDetail := strings.Join(why.NodeList, ", ")
+	if len(why.NodeList) == 0 {
+		placementStatus = doctorStatusWarn
+		placementSummary = "no node placement recorded yet"
+		placementDetail = "this is expected while a job is still queued"
+	}
+	report.Checks = append(report.Checks, doctorCheck{
+		Name:    "placement",
+		Status:  placementStatus,
+		Summary: placementSummary,
+		Detail:  placementDetail,
+	})
+
+	checkpointStatus := doctorStatusOK
+	checkpointSummary := "checkpointing is disabled for this job"
+	checkpointDetail := ""
+	if job.CheckpointMode == domain.CheckpointFilesystem {
+		checkpointStatus = doctorStatusWarn
+		checkpointSummary = "no checkpoints recorded yet"
+		if len(checkpoints) > 0 {
+			checkpointStatus = doctorStatusOK
+			last := checkpoints[0]
+			checkpointSummary = fmt.Sprintf("%d checkpoints recorded", len(checkpoints))
+			checkpointDetail = fmt.Sprintf("latest=%s verified=%t", last.Path, last.Verified)
+		}
+	} else if len(checkpoints) > 0 {
+		checkpointSummary = fmt.Sprintf("%d operator checkpoints recorded", len(checkpoints))
+		last := checkpoints[0]
+		checkpointDetail = fmt.Sprintf("latest=%s verified=%t", last.Path, last.Verified)
+	}
+	report.Checks = append(report.Checks, doctorCheck{
+		Name:    "checkpoints",
+		Status:  checkpointStatus,
+		Summary: checkpointSummary,
+		Detail:  checkpointDetail,
+	})
+
+	report.Suggestions = append(report.Suggestions, why.Suggestions...)
+	if why.CurrentState == domain.JobStateFailed {
+		report.Suggestions = append(report.Suggestions, "use `fuse logs "+job.ID+"` to inspect stdout/stderr")
+	}
+	if why.CurrentState == domain.JobStatePending {
+		report.Suggestions = append(report.Suggestions, "use `fuse topo --job "+job.ID+"` after the allocation starts")
+	}
+	finalizeDoctorReport(&report)
+	return report, nil
+}
+
+func findDoctorJob(jobs []domain.Job, target string) (domain.Job, bool) {
+	for _, job := range jobs {
+		if job.ID == target {
+			return job, true
+		}
+	}
+	for _, job := range jobs {
+		if job.Name == target {
+			return job, true
+		}
+	}
+	return domain.Job{}, false
+}
+
+func finalizeDoctorReport(report *doctorReport) {
+	worst := doctorStatusOK
+	var parts []string
+	seenSuggestions := map[string]struct{}{}
+	for _, check := range report.Checks {
+		if doctorSeverity(check.Status) > doctorSeverity(worst) {
+			worst = check.Status
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", check.Name, check.Status))
+	}
+	deduped := make([]string, 0, len(report.Suggestions))
+	for _, suggestion := range report.Suggestions {
+		suggestion = strings.TrimSpace(suggestion)
+		if suggestion == "" {
+			continue
+		}
+		if _, ok := seenSuggestions[suggestion]; ok {
+			continue
+		}
+		seenSuggestions[suggestion] = struct{}{}
+		deduped = append(deduped, suggestion)
+	}
+	report.Suggestions = deduped
+	report.Status = worst
+	switch report.Scope {
+	case "cluster":
+		report.Summary = "cluster doctor: " + strings.Join(parts, ", ")
+	default:
+		report.Summary = "job doctor: " + strings.Join(parts, ", ")
+	}
+}
+
+func doctorSeverity(status string) int {
+	switch status {
+	case doctorStatusFail:
+		return 2
+	case doctorStatusWarn:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func printDoctorReport(report doctorReport) {
+	fmt.Printf("scope=%s\ntarget=%s\nstatus=%s\nsummary=%s\n", report.Scope, report.Target, report.Status, report.Summary)
+	for _, check := range report.Checks {
+		fmt.Printf("check[%s]=%s :: %s\n", check.Name, check.Status, check.Summary)
+		if strings.TrimSpace(check.Detail) != "" {
+			fmt.Printf("detail[%s]=%s\n", check.Name, check.Detail)
+		}
+	}
+	for _, suggestion := range report.Suggestions {
+		fmt.Printf("suggestion: %s\n", suggestion)
+	}
 }
 
 func showLogs(ctx context.Context, cli cliAPI, args []string, jsonOut bool) error {
@@ -1560,6 +1918,35 @@ func lookupHelpTopic(name string) (helpTopic, bool) {
 				"fuse help topo",
 			},
 		}, true
+	case "doctor":
+		return helpTopic{
+			Name:    "doctor",
+			Summary: "Run a fast diagnosis over the current cluster view or a single Fuse-managed job.",
+			Usage: []string{
+				"fuse doctor [connection flags] cluster [--storage-path PATH]",
+				"fuse doctor [connection flags] --job <fuse-job-id>",
+				"fuse doctor [connection flags] <fuse-job-id-or-name>",
+			},
+			Notes: []string{
+				"This is intentionally lightweight. It composes existing Fuse reads instead of running deep telemetry probes.",
+				"Cluster doctor checks inventory, node health, storage headroom, and failed Fuse-managed jobs.",
+				"Job doctor checks scheduler state, placement visibility, and known checkpoints.",
+			},
+			Flags: []helpFlag{
+				{Name: "--job ID", Description: "Fuse job id or job name"},
+				{Name: "--storage-path PATH", Description: "filesystem path for the cluster storage check; defaults to /mnt/sharefs"},
+			},
+			Examples: []string{
+				"./fuse doctor cluster",
+				"./fuse doctor --job run-123",
+				"./fuse doctor run-123 --json",
+			},
+			SeeAlso: []string{
+				"fuse help status",
+				"fuse help why",
+				"fuse help checkpoints",
+			},
+		}, true
 	case "cancel":
 		return helpTopic{
 			Name:    "cancel",
@@ -1757,6 +2144,7 @@ func usage() {
 		"topo          Probe placement for a job or ephemeral allocation",
 		"shard         Estimate tensor, pipeline, and data parallel splits",
 		"why           Explain the scheduler state of a job",
+		"doctor        Run a quick diagnosis for the cluster or one job",
 	)
 	printHelpSection("Launch and manage jobs",
 		"submit        Submit a raw JSON JobSpec",
@@ -1779,6 +2167,7 @@ func usage() {
 		"./fuse jobs --addr http://127.0.0.1:9090",
 		"./fuse run --faker --name smoke --gpus 1 -- bash -lc 'nvidia-smi'",
 		"./fuse train --faker --example makemore --steps 200",
+		"./fuse doctor cluster",
 		"./fuse logs --faker --job run-123",
 		"./fuse topo --faker --job run-123",
 		"./fuse help run",

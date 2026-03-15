@@ -392,6 +392,17 @@ func (s *Service) SubmitJob(ctx context.Context, spec domain.JobSpec) (domain.Jo
 	if err != nil {
 		return domain.Job{}, err
 	}
+	if strings.TrimSpace(plan.Allocation.JobID) == "" {
+		summary := plan.Why.Summary
+		if strings.TrimSpace(summary) == "" {
+			summary = "planner returned no allocation"
+		}
+		detail := plan.Why.Detail
+		if strings.TrimSpace(detail) == "" {
+			detail = "planner did not produce a concrete placement"
+		}
+		return domain.Job{}, fmt.Errorf("%s: %s", summary, detail)
+	}
 	job.ReasonCode = plan.Why.ReasonCode
 	job.ReasonSummary = plan.Why.Summary
 	job.ReasonDetail = plan.Why.Detail

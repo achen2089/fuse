@@ -106,10 +106,12 @@ func (p *Planner) Plan(_ context.Context, in Input) (Output, error) {
 			score     int
 		}
 		bySwitch := map[string]switchBucket{}
+		switchMetadataAvailable := false
 		for _, node := range in.Nodes {
 			if strings.TrimSpace(node.SwitchName) == "" {
 				continue
 			}
+			switchMetadataAvailable = true
 			devices := availableByNode[node.ID]
 			bucket := bySwitch[node.SwitchName]
 			bucket.nodeIDs = append(bucket.nodeIDs, node.ID)
@@ -132,7 +134,7 @@ func (p *Planner) Plan(_ context.Context, in Input) (Output, error) {
 				best = &c
 			}
 		}
-		if best == nil && in.Job.TopologyHint == domain.TopologySameSwitch {
+		if best == nil && in.Job.TopologyHint == domain.TopologySameSwitch && switchMetadataAvailable {
 			return Output{
 				Why: domain.Why{
 					ReasonCode:  domain.ReasonTopologyUnsatisfied,

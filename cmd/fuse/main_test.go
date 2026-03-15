@@ -371,6 +371,87 @@ func TestShowStoragePrintsJSON(t *testing.T) {
 	}
 }
 
+func TestRunDoctorClusterPrintsChecks(t *testing.T) {
+	cli := &fakeCLI{
+		statusOutput: domain.ClusterStatus{
+			Nodes:       32,
+			Devices:     256,
+			Allocated:   80,
+			Idle:        176,
+			RunningJobs: 4,
+			PendingJobs: 1,
+			FailedJobs:  0,
+		},
+		nodesOutput: []domain.Node{
+			{Name: "gpu-001", Health: domain.HealthHealthy, ObservedState: "idle"},
+			{Name: "gpu-002", Health: domain.HealthHealthy, ObservedState: "mix"},
+		},
+		storageOutput: domain.StorageStatus{
+			Path: "/mnt/sharefs",
+			Filesystems: []domain.StorageFilesystem{{
+				Source:         "10.0.0.10@o2ib:/lustre",
+				Target:         "/mnt/sharefs",
+				SizeBytes:      61 * 1024 * 1024 * 1024 * 1024,
+				UsedBytes:      2 * 1024 * 1024 * 1024 * 1024,
+				AvailableBytes: 59 * 1024 * 1024 * 1024 * 1024,
+				UsePercent:     3,
+			}},
+		},
+	}
+
+	output := captureStdout(t, func() {
+		if err := runDoctor(context.Background(), cli, []string{"cluster"}, false); err != nil {
+			t.Fatalf("run doctor cluster: %v", err)
+		}
+	})
+
+	if cli.storagePath != "/mnt/sharefs" {
+		t.Fatalf("unexpected storage path: %q", cli.storagePath)
+	}
+	if !strings.Contains(output, "scope=cluster") || !strings.Contains(output, "check[inventory]=ok") || !strings.Contains(output, "check[storage]=ok") {
+		t.Fatalf("unexpected doctor output: %q", output)
+	}
+}
+
+func TestRunDoctorJobPrintsChecks(t *testing.T) {
+	cli := &fakeCLI{
+		jobsOutput: []domain.Job{{
+			ID:             "run-123",
+			Name:           "makemore-demo",
+			State:          domain.JobStatePending,
+			CheckpointMode: domain.CheckpointFilesystem,
+		}},
+		whyOutput: domain.Why{
+			JobID:        "run-123",
+			ReasonCode:   domain.ReasonSlurmQueueBacklog,
+			Summary:      "job is pending in Slurm",
+			Detail:       "Slurm has accepted the job but it is not running yet",
+			Suggestions:  []string{"wait for capacity", "use fuse why"},
+			CurrentState: domain.JobStatePending,
+			RawState:     "PENDING",
+		},
+		checkpointsOut: []domain.Checkpoint{{
+			JobID:     "run-123",
+			Path:      "/mnt/sharefs/user44/ckpt/step-100",
+			StepLabel: "step-100",
+			Verified:  true,
+		}},
+	}
+
+	output := captureStdout(t, func() {
+		if err := runDoctor(context.Background(), cli, []string{"run-123"}, false); err != nil {
+			t.Fatalf("run doctor job: %v", err)
+		}
+	})
+
+	if cli.whyJobID != "run-123" {
+		t.Fatalf("unexpected why job id: %q", cli.whyJobID)
+	}
+	if !strings.Contains(output, "scope=job") || !strings.Contains(output, "check[state]=warn") || !strings.Contains(output, "check[checkpoints]=ok") {
+		t.Fatalf("unexpected doctor job output: %q", output)
+	}
+}
+
 func TestResolveDirectSSHHostUsesLiveDefaultByDefault(t *testing.T) {
 	got := resolveDirectSSHHost(defaultDirectSSHHost, false, "", false, false)
 	if got != defaultDirectSSHHost {
@@ -510,6 +591,13 @@ type fakeCLI struct {
 	submitJob       domain.Job
 	submitErr       error
 	submittedSpec   domain.JobSpec
+	statusOutput    domain.ClusterStatus
+	statusErr       error
+	nodesOutput     []domain.Node
+	devicesOutput   []domain.Device
+	nodesErr        error
+	jobsOutput      []domain.Job
+	jobsErr         error
 	shardOutput     domain.ShardPlan
 	shardErr        error
 	shardRequest    domain.ShardRequest
@@ -524,16 +612,19 @@ type fakeCLI struct {
 	topologyOutput  domain.TopologyProbe
 	topologyErr     error
 	topologyRequest domain.TopologyRequest
+	whyOutput       domain.Why
+	whyErr          error
+	whyJobID        string
 	checkpointsOut  []domain.Checkpoint
 	checkpointsErr  error
 }
 
 func (f *fakeCLI) Status(context.Context) (domain.ClusterStatus, error) {
-	return domain.ClusterStatus{}, errors.New("not implemented")
+	return f.statusOutput, f.statusErr
 }
 
 func (f *fakeCLI) Nodes(context.Context) ([]domain.Node, []domain.Device, error) {
-	return nil, nil, errors.New("not implemented")
+	return f.nodesOutput, f.devicesOutput, f.nodesErr
 }
 
 func (f *fakeCLI) Fabric(context.Context) ([]domain.FabricLink, error) {
@@ -545,7 +636,7 @@ func (f *fakeCLI) Teams(context.Context) ([]domain.Team, error) {
 }
 
 func (f *fakeCLI) Jobs(context.Context) ([]domain.Job, error) {
-	return nil, errors.New("not implemented")
+	return f.jobsOutput, f.jobsErr
 }
 
 func (f *fakeCLI) Events(context.Context, int) ([]domain.Event, error) {
@@ -579,8 +670,9 @@ func (f *fakeCLI) Logs(_ context.Context, jobID, stream string, tailLines int) (
 	return f.logOutput, f.logErr
 }
 
-func (f *fakeCLI) Why(context.Context, string) (domain.Why, error) {
-	return domain.Why{}, errors.New("not implemented")
+func (f *fakeCLI) Why(_ context.Context, jobID string) (domain.Why, error) {
+	f.whyJobID = jobID
+	return f.whyOutput, f.whyErr
 }
 
 func (f *fakeCLI) Cancel(context.Context, string) error {
