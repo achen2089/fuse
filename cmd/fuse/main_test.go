@@ -197,7 +197,10 @@ func TestSubmitTrainBuildsMultiNodeNanochatSpec(t *testing.T) {
 	if cli.submittedSpec.Nodes != 2 || cli.submittedSpec.Tasks != 2 || cli.submittedSpec.TasksPerNode != 1 || cli.submittedSpec.GPUsPerNode != 8 {
 		t.Fatalf("unexpected multinode spec: %#v", cli.submittedSpec)
 	}
-	if got := cli.submittedSpec.CommandOrRecipe; !strings.Contains(got, "srun --ntasks=2 --ntasks-per-node=1") || !strings.Contains(got, "torchrun --nnodes=2") {
+	if cli.submittedSpec.ContainerImage != "" {
+		t.Fatalf("expected empty job-level image for multinode launch, got %q", cli.submittedSpec.ContainerImage)
+	}
+	if got := cli.submittedSpec.CommandOrRecipe; !strings.Contains(got, "srun --ntasks=2 --ntasks-per-node=1") || !strings.Contains(got, "--container-image='/mnt/sharefs/user44/fuse-ngc-pytorch-2502.sqsh'") || !strings.Contains(got, "torchrun --nnodes=2") {
 		t.Fatalf("unexpected multinode train command: %s", got)
 	}
 	if cli.submittedSpec.Env["NCCL_IB_DISABLE"] != "1" || cli.submittedSpec.Env["NCCL_SOCKET_IFNAME"] != "enp71s0" {

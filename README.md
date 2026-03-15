@@ -333,23 +333,20 @@ Slurm treats failure as "node went down, mark it DOWN, admin fixes it." That's r
 
 ```bash
 fuse doctor cluster
-# ⚠ node-03 GPU 6: 847 ECC errors in 24h (threshold: 100) — recommend drain
-# ⚠ leaf-02 → spine: 92% bandwidth utilization — congestion risk
-# ⚠ node-07 GPU 2: temperature 89°C (threshold: 85°C) — throttling likely
-# ✓ 8/9 nodes healthy
-# ✓ All checkpoints verified
-# ✓ No silent NCCL fallbacks detected
+# status=warn
+# ✓ 32 nodes and 256 GPUs visible
+# ✓ all discovered nodes look healthy
+# ✓ /mnt/sharefs has healthy free space
+# ⚠ 3 Fuse-managed jobs are in FAILED state
 
 fuse doctor job-abc123
-# ⚠ NCCL using TCP on ranks 2-3 (expected IB 400 Gbps, getting ~10 Gbps)
-# ⚠ Pipeline bubble 50% — consider TP=8 PP=1 DP=2 for this model
-# ⚠ GPU 5 on node-02: ECC trending (12 errors/hr, accelerating)
-# ✓ Checkpoints healthy (last: 4 min ago)
-# ✓ Memory: 54% (headroom OK)
-# ✓ All ranks responsive
+# status=warn
+# ✓ state is visible with raw Slurm detail
+# ✓ node placement is visible
+# ⚠ no checkpoints recorded yet
 ```
 
-Fuse watches ECC error rates, temperature trends, bandwidth degradation. When a GPU is heading toward failure, Fuse can preemptively drain that node and migrate jobs *before* the crash. Slurm can't do this because GPU health isn't part of the scheduler's world model.
+Today `fuse doctor` is a fast diagnostic wrapper over Fuse's current cluster view, job state, and storage visibility. ECC, temperature, NCCL, and deeper health telemetry are future work, not part of the current MVP.
 
 ### Granular: per-GPU, not per-node
 
@@ -899,7 +896,7 @@ The more honest current run-of-show lives in `DEMO.md`. The table below is the h
 | **GPU sharing** | Partition limits | Resource quotas | Burst + checkpoint preemption |
 | **Fair-share UX** | sprio/sshare (cryptic) | N/A | `fuse teams` (clear table) |
 | **Failures** | Admin requeues manually | Pod restart (no ckpt) | Auto ckpt recovery, 30s |
-| **Health** | None (use DCGM separately) | None (use DCGM separately) | `fuse doctor` (ECC, temp, NCCL) |
+| **Health** | None (use DCGM separately) | None (use DCGM separately) | `fuse doctor` (basic cluster/job diagnostics) |
 | **Capacity planning** | Spreadsheet | Spreadsheet | `fuse simulate` |
 | **Explain decisions** | `(Priority)` | `Pending: 0/1 nodes available` | `fuse why` with suggestions |
 | **Structured output** | No (flat text) | YAML (verbose) | `--json` on everything |

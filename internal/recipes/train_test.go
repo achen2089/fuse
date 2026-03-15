@@ -56,7 +56,10 @@ func TestBuildTrainSpecForMultiNodeNanochatUsesSrunLauncher(t *testing.T) {
 	if spec.Nodes != 2 || spec.Tasks != 2 || spec.TasksPerNode != 1 || spec.GPUsPerNode != 8 {
 		t.Fatalf("unexpected multinode layout: %#v", spec)
 	}
-	if !containsAll(spec.CommandOrRecipe, `srun --ntasks=2 --ntasks-per-node=1`, `torchrun --nnodes=2`, `--nproc-per-node=8`) {
+	if spec.ContainerImage != "" {
+		t.Fatalf("expected host-side launcher for multinode run, got image %q", spec.ContainerImage)
+	}
+	if !containsAll(spec.CommandOrRecipe, `srun --ntasks=2 --ntasks-per-node=1`, `--container-image='/mnt/sharefs/user44/fuse-ngc-pytorch-2502.sqsh'`, `torchrun --nnodes=2`, `--nproc-per-node=8`) {
 		t.Fatalf("unexpected multinode command: %s", spec.CommandOrRecipe)
 	}
 }

@@ -155,18 +155,32 @@ func BuildTrainSpec(in TrainInput) (domain.JobSpec, error) {
 		spec.CPUs = in.CPUs
 		spec.MemoryMB = in.MemoryMB
 		spec.Walltime = in.Walltime
-		spec.ContainerImage = in.Image
 		if in.Nodes > 1 {
+			spec.ContainerImage = ""
+			spec.ContainerMounts = nil
+			spec.ContainerWorkdir = ""
+			spec.ContainerMountHome = false
 			spec.CommandOrRecipe = wrapForHold(
-				buildMultiNodeNanochatCommand(in.Nodes, in.GPUsPerNode, path.Join(in.WorkloadRoot, "nanochat_smoke.py"), in.Steps),
+				buildMultiNodeNanochatCommand(
+					in.Nodes,
+					in.GPUsPerNode,
+					in.Image,
+					fmt.Sprintf("%s:%s", in.SharedRoot, in.SharedRoot),
+					in.SharedRoot,
+					in.MountHome,
+					path.Join(in.WorkloadRoot, "nanochat_smoke.py"),
+					in.Steps,
+				),
 				in.HoldSeconds,
 			)
 		} else if in.GPUs == 1 {
+			spec.ContainerImage = in.Image
 			spec.CommandOrRecipe = wrapForHold(
 				fmt.Sprintf("python %s --steps %d", shellQuote(path.Join(in.WorkloadRoot, "nanochat_smoke.py")), in.Steps),
 				in.HoldSeconds,
 			)
 		} else {
+			spec.ContainerImage = in.Image
 			spec.CommandOrRecipe = wrapForHold(
 				fmt.Sprintf("torchrun --standalone --nnodes=1 --nproc-per-node=%d %s --steps %d", in.GPUs, shellQuote(path.Join(in.WorkloadRoot, "nanochat_smoke.py")), in.Steps),
 				in.HoldSeconds,
@@ -239,7 +253,7 @@ func wrapForHold(command string, holdSeconds int) string {
 	)
 }
 
-func buildMultiNodeNanochatCommand(nodes, gpusPerNode int, scriptPath string, steps int) string {
+func buildMultiNodeNanochatCommand(nodes, gpusPerNode int, image, mount, workdir string, mountHome bool, scriptPath string, steps int) string {
 	launch := fmt.Sprintf(
 		`torchrun --nnodes=%d --node_rank="$SLURM_PROCID" --nproc-per-node=%d --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" %s --steps %d`,
 		nodes,
@@ -247,10 +261,18 @@ func buildMultiNodeNanochatCommand(nodes, gpusPerNode int, scriptPath string, st
 		shellQuote(scriptPath),
 		steps,
 	)
+	srunArgs := []string{
+		fmt.Sprintf(`--container-image=%s`, shellQuote(image)),
+		fmt.Sprintf(`--container-mounts=%s`, shellQuote(mount)),
+		fmt.Sprintf(`--container-workdir=%s`, shellQuote(workdir)),
+	}
+	if mountHome {
+		srunArgs = append(srunArgs, `--container-mount-home`)
+	}
 	parts := []string{
 		`export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"`,
 		`export MASTER_PORT="${MASTER_PORT:-29500}"`,
-		fmt.Sprintf(`srun --ntasks=%d --ntasks-per-node=1 bash -lc %s`, nodes, shellQuote(launch)),
+		fmt.Sprintf(`srun --ntasks=%d --ntasks-per-node=1 %s bash -lc %s`, nodes, strings.Join(srunArgs, " "), shellQuote(launch)),
 	}
 	return strings.Join(parts, "; ")
 }
