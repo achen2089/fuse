@@ -271,8 +271,8 @@ func buildMultiNodeNanochatCommand(nodes, gpusPerNode int, image, mount, workdir
 	}
 	parts := []string{
 		`export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"`,
-		`export MASTER_PORT="${MASTER_PORT:-29500}"`,
-		fmt.Sprintf(`srun --ntasks=%d --ntasks-per-node=1 %s bash -lc %s`, nodes, strings.Join(srunArgs, " "), shellQuote(launch)),
+		`export MASTER_PORT=29500`,
+		fmt.Sprintf(`srun --ntasks=%d --ntasks-per-node=1 --export=ALL,MASTER_ADDR="$MASTER_ADDR",MASTER_PORT="$MASTER_PORT" %s bash -lc %s`, nodes, strings.Join(srunArgs, " "), shellQuote(launch)),
 	}
 	return strings.Join(parts, "; ")
 }
